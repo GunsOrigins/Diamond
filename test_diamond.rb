@@ -3,9 +3,24 @@ require 'minitest/autorun'
 
 Diamond.wake_up(":memory:")
 
-Diamond.engine.db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)")
-Diamond.engine.db.execute("CREATE TABLE categories (id INTEGER PRIMARY KEY, name TEXT, parent_id INTEGER)")
-Diamond.engine.db.execute("CREATE TABLE posts (id INTEGER PRIMARY KEY, user_id INTEGER, title TEXT, created_at TEXT)")
+Diamond.create_table(:users) do |t|
+  t.primary_key :id
+  t.text :name
+  t.integer :age
+end
+
+Diamond.create_table(:categories) do |t|
+  t.primary_key :id
+  t.text :name
+  t.integer :parent_id
+end
+
+Diamond.create_table(:posts) do |t|
+  t.primary_key :id
+  t.integer :user_id
+  t.text :title
+  t.text :created_at
+end
 
 Diamond.engine.reload_schema!
 

@@ -2,6 +2,7 @@ require_relative 'diamond/engine'
 require_relative 'diamond/table'
 require_relative 'diamond/query_object'
 require_relative 'diamond/null_table'
+require_relative 'diamond/table_definition'
 
 module Diamond
   class TableNotFound < StandardError; end
@@ -61,6 +62,15 @@ module Diamond
     dummy_table = Diamond::NullTable.new(name)
     
     QueryObject.new(dummy_table, [AST::With.new(name, union_node, recursive: true)])
+  end
+
+  def self.create_table(name, &block)
+    definition = TableDefinition.new(name)
+    definition.instance_eval(&block)
+    
+    engine.db.execute(definition.to_sql)
+    
+    engine.reload_schema!
   end
 end
 
