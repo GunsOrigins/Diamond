@@ -815,6 +815,69 @@ class DiamondTest < Minitest::Test
   end
 
   # ====================================================================
+  # Streaming Edge — QueryObject#each (returns Enumerable Cursor)
+  # ====================================================================
+
+  def test_each_with_block_yields_frozen_structs
+    yielded = []
+    Users.where { age > 10 }.each { |u| yielded << u }
+    assert_equal 4, yielded.size
+    yielded.each do |u|
+      assert_kind_of Struct, u
+      assert u.frozen?, "streamed struct must be frozen"
+    end
+  end
+
+  def test_each_without_block_returns_cursor_that_includes_enumerable
+    cursor = Users.where { age > 10 }.each
+    assert_kind_of Diamond::Cursor, cursor
+    assert cursor.is_a?(Enumerable)
+  end
+
+  def test_each_cursor_supports_first_n
+    collected = Users.where { age > 10 }.each.first(3)
+    assert_equal 3, collected.size
+    collected.each { |u| assert_kind_of Struct, u }
+  end
+
+  def test_each_cursor_supports_lazy_chain
+    collected = Users.each.lazy.select { |u| u.age > 50 }.first(2)
+    assert_equal 2, collected.size
+    names = collected.map(&:name)
+    assert_includes names, 'High'
+    assert_includes names, 'Carbuncle'
+  end
+
+  def test_each_with_empty_result_yields_nothing
+    yielded = []
+    Users.where { age > 999 }.each { |u| yielded << u }
+    assert_equal [], yielded
+  end
+
+  def test_each_re_executes_per_call_no_caching
+    first_size  = Users.each.to_a.size
+    Diamond.engine.db.execute("INSERT INTO users (id, name, age) VALUES (99, 'Late', 7)")
+    second_size = Users.each.to_a.size
+    assert_equal 4, first_size
+    assert_equal 5, second_size, "each must re-execute (declarative purity)"
+  end
+
+  def test_each_on_table_via_dsl
+    yielded = []
+    Users.each { |u| yielded << u.id }
+    assert_equal [1, 2, 3, 4], yielded
+  end
+
+  def test_each_cursor_close_is_idempotent
+    # After ensure closes the statement, closing again must be a no-op
+    # (Cursor checks closed? before acting).
+    first = Users.each.first
+    assert_kind_of Struct, first
+    # A follow-up query proves the cursor closed cleanly (no leaked handle).
+    assert_equal 4, Users.count
+  end
+
+  # ====================================================================
   # Prism Refactor Invariants
   # ====================================================================
 

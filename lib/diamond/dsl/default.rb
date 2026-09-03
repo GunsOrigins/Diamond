@@ -107,6 +107,13 @@ module Diamond
         _wrap.last(n)
       end
 
+      # Streaming edge — yields Structs one at a time via a Cursor (see
+      # lib/diamond/cursor.rb). Returns an Enumerator when called without
+      # a block, so Ruby `lazy`/`.first(n)`/`.each_slice` all work.
+      def each(&block)
+        _wrap.each(&block)
+      end
+
       private
 
       def _wrap

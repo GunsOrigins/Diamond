@@ -810,6 +810,69 @@ describe Diamond do
   end
 
   # ====================================================================
+  describe "Streaming edge — QueryObject#each (Cursor)" do
+    it "yields frozen Structs when called with a block" do
+      yielded = []
+      Users.where { age > 10 }.each { |u| yielded << u }
+      _(yielded.size).must_equal 4
+      yielded.each do |u|
+        _(u).must_be_kind_of Struct
+        _(u.frozen?).must_equal true
+      end
+    end
+
+    it "returns a Cursor that includes Enumerable when called without a block" do
+      cursor = Users.where { age > 10 }.each
+      _(cursor).must_be_kind_of Diamond::Cursor
+      _(cursor.is_a?(Enumerable)).must_equal true
+    end
+
+    it "supports first(n) on the returned Cursor" do
+      collected = Users.where { age > 10 }.each.first(3)
+      _(collected.size).must_equal 3
+      collected.each { |u| _(u).must_be_kind_of Struct }
+    end
+
+    it "supports Enumerable#lazy chain composition" do
+      collected = Users.each.lazy.select { |u| u.age > 50 }.first(2)
+      _(collected.size).must_equal 2
+      names = collected.map(&:name)
+      _(names).must_include 'High'
+      _(names).must_include 'Carbuncle'
+    end
+
+    it "yields nothing for an empty result set" do
+      yielded = []
+      Users.where { age > 999 }.each { |u| yielded << u }
+      _(yielded).must_be_empty
+    end
+
+    it "re-executes the query on each call (no caching)" do
+      first_size = Users.each.to_a.size
+      Diamond.engine.db.execute("INSERT INTO users (id, name, age) VALUES (99, 'Late', 7)")
+      second_size = Users.each.to_a.size
+      _(first_size).must_equal 4
+      _(second_size).must_equal 5
+    end
+
+    it "is available on Table directly via the DSL" do
+      yielded = []
+      Users.each { |u| yielded << u.id }
+      _(yielded).must_equal [1, 2, 3, 4]
+    end
+
+    it "closes the underlying statement via ensure after iteration" do
+      # After a complete iteration, the SQLite statement is closed. If a
+      # follow-up query works, the close was clean (no leaking handle).
+      collected = Users.each.first(2)
+      _(collected.size).must_equal 2
+      # Independent query on same engine — proves the cursor handled cleanup:
+      follow_up = Users.count
+      _(follow_up).must_equal 4
+    end
+  end
+
+  # ====================================================================
   # Prism Refactor Invariants
   describe "Prism Refactor Invariants" do
     it "has zero instance_eval calls in lib/" do

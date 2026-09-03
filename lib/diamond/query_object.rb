@@ -1,5 +1,6 @@
 require_relative 'struct_factory'
 require_relative 'compiler/base'
+require_relative 'cursor'
 
 module Diamond
   class QueryObject
@@ -38,6 +39,27 @@ module Diamond
       scope = has_order? ? self : order(:id)
       results = scope.limit(n).materialize
       n == 1 ? results.first : results
+    end
+
+    # Lazy streaming edge. Returns a Diamond::Cursor (Enumerable) when
+    # called without a block; yields frozen Structs one at a time when
+    # given a block. Opens a fresh SQLite statement each call — no caching
+    # (declarative purity preserved). See lib/diamond/cursor.rb.
+    def each(&block)
+      compiled_sql, compiled_params = Diamond::Compiler::Base.compile(@table, @ast)
+      stmt = Diamond.engine.db.prepare(compiled_sql)
+      stmt.bind_params(compiled_params)
+
+      projection_node   = @ast.find { |n| n.is_a?(AST::Projection) }
+      projected_columns = projection_node&.columns
+
+      cursor = Diamond::Cursor.new(@table, stmt, projected_columns)
+
+      if block
+        cursor.each(&block)
+      else
+        cursor
+      end
     end
 
     # n == 1 returns a single Struct; n > 1 returns an Array of Structs in

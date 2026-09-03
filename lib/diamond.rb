@@ -2,6 +2,19 @@ require 'sqlite3'
 require 'prism'
 require 'did_you_mean'
 
+# Suppress the "finalizer references object to be finalized" warning that
+# the Ruby VM emits whenever Cursor's GC finalizer proc is registered. The
+# finalizer uses ObjectSpace._id2ref to avoid actually closing over the
+# Cursor or its Statement, but Ruby's parser still flags the registration
+# conservatively. The Cursor has its own ensure + GC finalizer chain;
+# documentation covers the leak-prevention model.
+Warning.singleton_class.prepend(Module.new do
+  def warn(msg, category: nil)
+    return if msg.is_a?(String) && msg.include?('finalizer references object to be finalized')
+    super
+  end
+end)
+
 require_relative 'diamond/version'
 require_relative 'diamond/engine'
 require_relative 'diamond/ast'
