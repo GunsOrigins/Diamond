@@ -26,8 +26,29 @@ module Diamond
         ast = _build_relation(name, &block)
         sql, params = Diamond::Compiler::DDL.compile(ast)
         Diamond.engine.db.execute(sql, *params)
+
+        # Any indexes declared inline (`t.index ...`) are emitted after the
+        # table exists. SQLite enforces FKs only when PRAGMA foreign_keys=ON
+        # (auto-enabled by Diamond.wake_up), which is required for cascades.
+        ast.columns.select { |c| c.is_a?(Diamond::AST::IndexDefinition) }.each do |idx|
+          idx_sql, idx_params = Diamond::Compiler::DDL.compile_index(idx, name)
+          Diamond.engine.db.execute(idx_sql, *idx_params)
+        end
+
         Diamond.engine.reload_schema!
         ast
+      end
+
+      # Top-level imperative index creation.
+      #   Diamond.create_index :widgets, [:a, :b], unique: true, name: :idx_widgets_ab
+      def create_index(table_name, columns, unique: false, name:)
+        raise ArgumentError, "create_index requires `name:` kwarg" unless name
+        raise ArgumentError, "create_index requires at least one column" if Array(columns).empty?
+        idx = Diamond::AST::IndexDefinition.new(name, columns, unique: !!unique)
+        sql, params = Diamond::Compiler::DDL.compile_index(idx, table_name)
+        Diamond.engine.db.execute(sql, *params)
+        Diamond.engine.reload_schema!
+        idx
       end
 
       def create(**kwargs)

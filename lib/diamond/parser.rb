@@ -4,7 +4,7 @@ module Diamond
   module Parser
     WINDOW_FUNCS = [:row_number, :rank, :dense_rank, :lag, :lead].freeze
     AGGREGATIONS = [:count, :sum, :avg, :min, :max].freeze
-    DDL_METHODS  = [:attribute, :primary_key, :foreign_key].freeze
+    DDL_METHODS  = [:attribute, :primary_key, :foreign_key, :index].freeze
 
     @file_cache = {}
     @where_cache = {}
@@ -158,14 +158,40 @@ module Diamond
       when Prism::ParenthesesNode
         translate_where(node.body, schema)
       when Prism::CallNode
-        if node.name == :proc && node.block
-          translate_where(node.block, schema)
-        elsif node.receiver.nil? && node.arguments.nil?
-          validate_column!(node.name, schema)
-          AST::Column.new(node.name)
-        elsif node.receiver && node.arguments
-          left = translate_where(node.receiver, schema)
-          right = translate_where(node.arguments.arguments.first, schema)
+          # Explicit `.in(1, 2, 3)` form — must be intercepted BEFORE the
+          # binary-operator fallthrough because it's a multi-arg call.
+          # Zero-arg `id.in()` is also handled here (node.arguments is nil).
+          # Receivers must be set; bareword column access goes through the
+          # no-receiver branch below.
+          if node.name == :in && node.receiver
+            lhs  = translate_where(node.receiver, schema)
+            vals = node.arguments ? node.arguments.arguments.map { |a| translate_where(a, schema) } : []
+            return AST::In.new(lhs, vals)
+          end
+
+          if node.name == :proc && node.block
+            translate_where(node.block, schema)
+          elsif node.receiver.nil? && node.arguments.nil?
+            validate_column!(node.name, schema)
+            AST::Column.new(node.name)
+          elsif node.receiver && node.arguments
+
+          left      = translate_where(node.receiver, schema)
+          right_arg = node.arguments.arguments.first
+
+          # Array overload: id == [1, 2, 3] → AST::In
+          if node.name == :== && right_arg.is_a?(Prism::ArrayNode)
+            vals = right_arg.elements.map { |e| translate_where(e, schema) }
+            return AST::In.new(left, vals)
+          end
+
+          # Array overload: id != [1, 2, 3] → AST::NotIn
+          if node.name == :"!=" && right_arg.is_a?(Prism::ArrayNode)
+            vals = right_arg.elements.map { |e| translate_where(e, schema) }
+            return AST::NotIn.new(left, vals)
+          end
+
+          right = translate_where(right_arg, schema)
           case node.name
           when :> then AST::GreaterThan.new(left, right)
           when :< then AST::LessThan.new(left, right)
@@ -176,9 +202,9 @@ module Diamond
           else
             raise BlockMismatch, "Unsupported operator: #{node.name}"
           end
-        else
-          raise BlockMismatch, "Unsupported call: #{node.inspect}"
-        end
+          else
+            raise BlockMismatch, "Unsupported call: #{node.inspect}"
+          end
       when Prism::AndNode
         AST::And.new(translate_where(node.left, schema), translate_where(node.right, schema))
       when Prism::OrNode
@@ -276,7 +302,31 @@ module Diamond
         local = symbol_value(positional[0])
         ref_table = symbol_value(positional[1])
         ref_col = positional[2] ? symbol_value(positional[2]) : :id
-        AST::ForeignKey.new(local, ref_table, ref_col)
+
+        on_delete = kwargs[:on_delete]
+        on_update = kwargs[:on_update]
+        valid_actions = %i[cascade set_null set_default restrict no_action]
+        if on_delete
+          on_delete = on_delete.to_sym
+          unless valid_actions.include?(on_delete)
+            raise ArgumentError, "unknown on_delete action: #{on_delete.inspect}; must be one of #{valid_actions.inspect}"
+          end
+        end
+        if on_update
+          on_update = on_update.to_sym
+          unless valid_actions.include?(on_update)
+            raise ArgumentError, "unknown on_update action: #{on_update.inspect}; must be one of #{valid_actions.inspect}"
+          end
+        end
+
+        AST::ForeignKey.new(local, ref_table, ref_col,
+                            on_delete: on_delete, on_update: on_update)
+      when :index
+        raise "index requires at least one column" if positional.empty?
+        cols = positional.map { |a| symbol_value(a) }
+        idx_name = kwargs[:name] || raise(ArgumentError, "index requires `name:` kwarg")
+        unique = !!kwargs[:unique]
+        AST::IndexDefinition.new(idx_name, cols, unique: unique)
       end
     end
 

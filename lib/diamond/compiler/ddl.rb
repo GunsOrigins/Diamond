@@ -34,7 +34,20 @@ module Diamond
       end
 
       def self.render_foreign_key(node)
-        "FOREIGN KEY (#{node.local_column}) REFERENCES #{node.ref_table}(#{node.ref_column})"
+        sql = "FOREIGN KEY (#{node.local_column}) REFERENCES #{node.ref_table}(#{node.ref_column})"
+        sql += " ON DELETE #{format_action(node.on_delete)}" if node.on_delete
+        sql += " ON UPDATE #{format_action(node.on_update)}" if node.on_update
+        sql
+      end
+
+      def self.format_action(sym)
+        sym.to_s.upcase.tr('_', ' ')
+      end
+
+      def self.compile_index(index_node, table_name)
+        unique_kw = index_node.unique ? 'UNIQUE ' : ''
+        sql = "CREATE #{unique_kw}INDEX #{index_node.name} ON #{table_name}(#{index_node.columns.join(', ')})"
+        [sql, []]
       end
     end
   end

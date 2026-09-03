@@ -47,9 +47,30 @@ module Diamond
     class Equality < BinaryOp
       def initialize(left, right); super(left, right, :'='); end
     end
-    
+
     class NotEqual < BinaryOp
       def initialize(left, right); super(left, right, :'<>'); end
+    end
+
+    # `WHERE col IN (v1, v2, v3)`. `left` is typically an AST::Column;
+    # `right` is an Array of AST nodes (usually AST::Literal, but
+    # expressions are allowed too).
+    class In < Node
+      attr_reader :left, :right
+      def initialize(left, right)
+        @left = left
+        @right = right
+      end
+    end
+
+    # `WHERE col NOT IN (v1, v2, v3)`. Same shape as In; emitted as
+    # `NOT IN` in SQL.
+    class NotIn < Node
+      attr_reader :left, :right
+      def initialize(left, right)
+        @left = left
+        @right = right
+      end
     end
 
     class GreaterThan < BinaryOp
@@ -187,16 +208,34 @@ module Diamond
     end
 
     # Table-level FOREIGN KEY constraint referencing another table.
+    # `on_delete` / `on_update` are one of: :cascade, :set_null,
+    # :set_default, :restrict, :no_action. `nil` means no action clause
+    # is emitted (DB default).
     class ForeignKey < Node
-      attr_reader :local_column, :ref_table, :ref_column
-      def initialize(local_column, ref_table, ref_column = :id)
+      attr_reader :local_column, :ref_table, :ref_column, :on_delete, :on_update
+      def initialize(local_column, ref_table, ref_column = :id,
+                     on_delete: nil, on_update: nil)
         @local_column = local_column
         @ref_table = ref_table
         @ref_column = ref_column
+        @on_delete = on_delete
+        @on_update = on_update
       end
     end
 
-    # --- DML Nodes (Phase 3) ---
+    # `CREATE [UNIQUE] INDEX name ON table(cols)`. Lifted into AST so
+    # `define_relation` can emit CREATE TABLE then CREATE INDEX in one
+    # transactional sweep.
+    class IndexDefinition < Node
+      attr_reader :name, :columns, :unique
+      def initialize(name, columns, unique: false)
+        @name = name
+        @columns = columns
+        @unique = unique
+      end
+    end
+
+    # --- DML Nodes ---
 
     # INSERT INTO statement. `data` is a Hash mapping column name (Symbol) to value.
     class Insert < Node

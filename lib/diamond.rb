@@ -44,6 +44,10 @@ module Diamond
 
   def self.wake_up(db_path)
     @engine = Engine.new(db_path)
+    # Enable FK action clauses (CASCADE / SET NULL / etc.) at the SQLite
+    # connection level. The pragma is per-connection; this also runs for
+    # `:memory:` databases where the default is OFF.
+    @engine.db.execute('PRAGMA foreign_keys = ON')
 
     Diamond::Table.include(Diamond::DSL::Default)
     Diamond::Table.include(Diamond::Domains::DQL)

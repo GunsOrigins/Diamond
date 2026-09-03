@@ -110,6 +110,19 @@ module Diamond
           else
             "#{left} #{node.operator} #{right}"
           end
+        when AST::In, AST::NotIn
+          # Empty array → tautologically false (IN) or true (NOT IN).
+          # SQL disallows `IN ()` / `NOT IN ()` so we substitute a constant
+          # predicate that always evaluates to the right polarity.
+          if node.right.empty?
+            return node.is_a?(AST::NotIn) ? '1=1' : '1=0'
+          end
+          # Emit each element via translate_node — handles Literals (pushes
+          # value to params, emits `?`) AND expression elements (Column refs,
+          # BinaryOps, etc. emit their SQL form with no `?` placeholder).
+          element_sqls = node.right.map { |r| translate_node(r, params) }
+          kw = node.is_a?(AST::NotIn) ? 'NOT IN' : 'IN'
+          "#{translate_node(node.left, [])} #{kw} (#{element_sqls.join(', ')})"
         else
           raise "Unknown AST Node: #{node.class}"
         end

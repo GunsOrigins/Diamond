@@ -137,6 +137,102 @@ class DiamondTest < Minitest::Test
   end
 
   # ====================================================================
+  # DDL — FK Actions & Indexes
+  # ====================================================================
+
+  def test_foreign_key_on_delete_cascade_emits_clause
+    ast = Diamond._build_relation(:widgets) do |t|
+      t.attribute :id, Integer, primary_key: true, nullable: false
+      t.attribute :owner_id, Integer
+      t.foreign_key :owner_id, :owners, on_delete: :cascade
+    end
+    sql, _ = Diamond::Compiler::DDL.compile(ast)
+    assert_match(/ON DELETE CASCADE/, sql)
+  end
+
+  def test_foreign_key_on_update_set_null_emits_clause
+    ast = Diamond._build_relation(:widgets) do |t|
+      t.attribute :id, Integer, primary_key: true, nullable: false
+      t.attribute :owner_id, Integer
+      t.foreign_key :owner_id, :owners, on_update: :set_null
+    end
+    sql, _ = Diamond::Compiler::DDL.compile(ast)
+    assert_match(/ON UPDATE SET NULL/, sql)
+  end
+
+  def test_foreign_key_without_actions_emits_no_clause
+    ast = Diamond._build_relation(:widgets) do |t|
+      t.attribute :id, Integer, primary_key: true, nullable: false
+      t.attribute :owner_id, Integer
+      t.foreign_key :owner_id, :owners
+    end
+    sql, _ = Diamond::Compiler::DDL.compile(ast)
+    refute_match(/ON (DELETE|UPDATE)/, sql)
+  end
+
+  def test_foreign_key_unknown_action_raises_at_parse_time
+    err = assert_raises(ArgumentError) do
+      Diamond.define_relation(:widgets) do |t|
+        t.attribute :id, Integer, primary_key: true, nullable: false
+        t.attribute :owner_id, Integer
+        t.foreign_key :owner_id, :owners, on_delete: :bogus
+      end
+    end
+    assert_match(/unknown on_delete action/, err.message)
+  end
+
+  def test_inline_index_emits_create_unique_index
+    Diamond.define_relation(:widgets) do |t|
+      t.attribute :id, Integer, primary_key: true, nullable: false
+      t.attribute :name, String
+      t.index :name, unique: true, name: :idx_widgets_name
+    end
+    indexes = Diamond.engine.db.execute("PRAGMA index_list(widgets)")
+    names = indexes.map { |row| row['name'] }
+    assert_includes names, 'idx_widgets_name'
+    unique_row = indexes.find { |row| row['name'] == 'idx_widgets_name' }
+    assert_equal 1, unique_row['unique']
+  end
+
+  def test_inline_index_non_unique_emits_plain_index
+    Diamond.define_relation(:widgets2) do |t|
+      t.attribute :id, Integer, primary_key: true, nullable: false
+      t.attribute :a, Integer
+      t.attribute :b, Integer
+      t.index :a, :b, name: :idx_w2_ab
+    end
+    indexes = Diamond.engine.db.execute("PRAGMA index_list(widgets2)")
+    row = indexes.find { |r| r['name'] == 'idx_w2_ab' }
+    assert row, "expected idx_w2_ab in #{indexes.inspect}"
+    assert_equal 0, row['unique']
+  end
+
+  def test_top_level_create_index_via_diamond_method
+    Diamond.define_relation(:widgets3) do |t|
+      t.attribute :id, Integer, primary_key: true, nullable: false
+      t.attribute :a, Integer
+    end
+    Diamond.create_index :widgets3, [:a], unique: true, name: :idx_w3_a
+    row = Diamond.engine.db.execute("PRAGMA index_list(widgets3)").find { |r| r['name'] == 'idx_w3_a' }
+    assert row
+    assert_equal 1, row['unique']
+  end
+
+  def test_create_index_requires_name_kwarg
+    Diamond.define_relation(:widgets4) do |t|
+      t.attribute :id, Integer, primary_key: true, nullable: false
+    end
+    assert_raises(ArgumentError) { Diamond.create_index :widgets4, [:id] }
+  end
+
+  def test_wake_up_enables_foreign_keys_pragma
+    Diamond.wake_up(':memory:')
+    row = Diamond.engine.db.execute('PRAGMA foreign_keys').first
+    assert_equal 1, row.values.first,
+                 "PRAGMA should be ON after wake_up so FK actions enforce"
+  end
+
+  # ====================================================================
   # DQL — Where / Find / Materialize
   # ====================================================================
 
@@ -202,6 +298,106 @@ class DiamondTest < Minitest::Test
     assert_equal 1, base.ast.size
     assert_equal 2, composed.ast.size
     assert_equal "Carbuncle", composed.first.name
+  end
+
+  # IN clause (array overload + explicit .in method + NOT IN)
+
+  def test_in_via_array_overload
+    q = Users.where { id == [1, 2] }
+    sql, params = Diamond::Compiler::Base.compile(q.table, q.ast)
+    assert_equal "SELECT * FROM users WHERE id IN (?, ?)", sql
+    assert_equal [1, 2], params
+    assert_equal 2, q.materialize.size
+  end
+
+  def test_in_via_explicit_in_method
+    q = Users.where { id.in(1, 2) }
+    sql, params = Diamond::Compiler::Base.compile(q.table, q.ast)
+    assert_equal "SELECT * FROM users WHERE id IN (?, ?)", sql
+    assert_equal [1, 2], params
+  end
+
+  def test_array_overload_and_explicit_in_produce_identical_sql
+    a = Users.where { id == [1, 2] }
+    b = Users.where { id.in(1, 2) }
+    sql_a, params_a = Diamond::Compiler::Base.compile(a.table, a.ast)
+    sql_b, params_b = Diamond::Compiler::Base.compile(b.table, b.ast)
+    assert_equal sql_a, sql_b
+    assert_equal params_a, params_b
+  end
+
+  def test_in_with_string_literals
+    q = Users.where { name == ["Arle", "Carbuncle"] }
+    sql, params = Diamond::Compiler::Base.compile(q.table, q.ast)
+    assert_equal "SELECT * FROM users WHERE name IN (?, ?)", sql
+    assert_equal ["Arle", "Carbuncle"], params
+  end
+
+  def test_in_with_empty_array_overload_generates_no_match_predicate
+    q = Users.where { id == [] }
+    sql, params = Diamond::Compiler::Base.compile(q.table, q.ast)
+    assert_equal "SELECT * FROM users WHERE 1=0", sql
+    assert_equal [], params
+    assert_equal [], q.materialize
+  end
+
+  def test_in_with_empty_explicit_call_generates_no_match_predicate
+    q = Users.where { id.in() }
+    sql, _ = Diamond::Compiler::Base.compile(q.table, q.ast)
+    assert_equal "SELECT * FROM users WHERE 1=0", sql
+  end
+
+  def test_in_with_single_value
+    q = Users.where { id.in(5) }
+    sql, params = Diamond::Compiler::Base.compile(q.table, q.ast)
+    assert_equal "SELECT * FROM users WHERE id IN (?)", sql
+    assert_equal [5], params
+  end
+
+  def test_in_with_five_values_generates_five_placeholders
+    q = Users.where { id.in(1, 2, 3, 4, 5) }
+    sql, params = Diamond::Compiler::Base.compile(q.table, q.ast)
+    assert_equal "SELECT * FROM users WHERE id IN (?, ?, ?, ?, ?)", sql
+    assert_equal [1, 2, 3, 4, 5], params
+  end
+
+  def test_in_chains_with_other_conditions
+    q = Users.where { id.in(1, 2) }
+    q = q.where { name == "Arle" }
+    sql, params = Diamond::Compiler::Base.compile(q.table, q.ast)
+    assert_equal "SELECT * FROM users WHERE id IN (?, ?) AND name = ?", sql
+    assert_equal [1, 2, "Arle"], params
+  end
+
+  def test_in_array_element_may_be_a_column_reference
+    q = Users.where { id == [id] }
+    sql, params = Diamond::Compiler::Base.compile(q.table, q.ast)
+    assert_equal "SELECT * FROM users WHERE id IN (id)", sql
+    assert_equal [], params
+    assert_equal 4, q.materialize.size, "id IN (id) is tautologically true"
+  end
+
+  def test_not_in_via_unequal_array_overload
+    q = Users.where { id != [1, 2] }
+    sql, params = Diamond::Compiler::Base.compile(q.table, q.ast)
+    assert_equal "SELECT * FROM users WHERE id NOT IN (?, ?)", sql
+    assert_equal [1, 2], params
+    assert_equal 2, q.materialize.size, "3 of 4 rows excluded"
+  end
+
+  def test_not_in_with_empty_array_generates_match_all_predicate
+    q = Users.where { id != [] }
+    sql, params = Diamond::Compiler::Base.compile(q.table, q.ast)
+    assert_equal "SELECT * FROM users WHERE 1=1", sql
+    assert_equal [], params
+    assert_equal 4, q.materialize.size, "NOT IN () is tautologically true"
+  end
+
+  def test_not_equal_with_scalar_unchanged
+    q = Users.where { id != 5 }
+    sql, params = Diamond::Compiler::Base.compile(q.table, q.ast)
+    assert_equal "SELECT * FROM users WHERE id <> ?", sql
+    assert_equal [5], params
   end
 
   # ====================================================================

@@ -192,6 +192,107 @@ describe Diamond do
   end
 
   # ====================================================================
+  describe "::where IN clause" do
+    it "translates id == [1, 2] to SELECT ... WHERE id IN (?, ?)" do
+      q = Users.where { id == [1, 2] }
+      sql, params = Diamond::Compiler::Base.compile(q.table, q.ast)
+      _(sql).must_equal "SELECT * FROM users WHERE id IN (?, ?)"
+      _(params).must_equal [1, 2]
+      _(q.materialize.size).must_equal 2
+    end
+
+    it "translates id.in(1, 2) to the same SELECT ... WHERE id IN (?, ?)" do
+      q = Users.where { id.in(1, 2) }
+      sql, params = Diamond::Compiler::Base.compile(q.table, q.ast)
+      _(sql).must_equal "SELECT * FROM users WHERE id IN (?, ?)"
+      _(params).must_equal [1, 2]
+    end
+
+    it "produces identical compiled SQL for both IN forms" do
+      a = Users.where { id == [1, 2] }
+      b = Users.where { id.in(1, 2) }
+      sql_a, params_a = Diamond::Compiler::Base.compile(a.table, a.ast)
+      sql_b, params_b = Diamond::Compiler::Base.compile(b.table, b.ast)
+      _(sql_a).must_equal sql_b
+      _(params_a).must_equal params_b
+    end
+
+    it "supports string-literal IN values" do
+      q = Users.where { name == ["Arle", "Carbuncle"] }
+      sql, params = Diamond::Compiler::Base.compile(q.table, q.ast)
+      _(sql).must_equal "SELECT * FROM users WHERE name IN (?, ?)"
+      _(params).must_equal ["Arle", "Carbuncle"]
+    end
+
+    it "emits 1=0 for an empty array overload" do
+      q = Users.where { id == [] }
+      sql, params = Diamond::Compiler::Base.compile(q.table, q.ast)
+      _(sql).must_equal "SELECT * FROM users WHERE 1=0"
+      _(params).must_equal []
+      _(q.materialize).must_be_empty
+    end
+
+    it "emits 1=0 for an empty explicit .in() call" do
+      q = Users.where { id.in() }
+      sql, _ = Diamond::Compiler::Base.compile(q.table, q.ast)
+      _(sql).must_equal "SELECT * FROM users WHERE 1=0"
+    end
+
+    it "supports a single-element IN" do
+      q = Users.where { id.in(5) }
+      sql, params = Diamond::Compiler::Base.compile(q.table, q.ast)
+      _(sql).must_equal "SELECT * FROM users WHERE id IN (?)"
+      _(params).must_equal [5]
+    end
+
+    it "expands five-value IN into five placeholders" do
+      q = Users.where { id.in(1, 2, 3, 4, 5) }
+      sql, params = Diamond::Compiler::Base.compile(q.table, q.ast)
+      _(sql).must_equal "SELECT * FROM users WHERE id IN (?, ?, ?, ?, ?)"
+      _(params).must_equal [1, 2, 3, 4, 5]
+    end
+
+    it "chains IN with other WHERE conditions" do
+      q = Users.where { id.in(1, 2) }
+      q = q.where { name == "Arle" }
+      sql, params = Diamond::Compiler::Base.compile(q.table, q.ast)
+      _(sql).must_equal "SELECT * FROM users WHERE id IN (?, ?) AND name = ?"
+      _(params).must_equal [1, 2, "Arle"]
+    end
+
+    it "accepts a column reference inside the IN array" do
+      q = Users.where { id == [id] }
+      sql, params = Diamond::Compiler::Base.compile(q.table, q.ast)
+      _(sql).must_equal "SELECT * FROM users WHERE id IN (id)"
+      _(params).must_equal []
+      _(q.materialize.size).must_equal 4, "id IN (id) is tautologically true"
+    end
+
+    it "translates id != [1, 2] to NOT IN" do
+      q = Users.where { id != [1, 2] }
+      sql, params = Diamond::Compiler::Base.compile(q.table, q.ast)
+      _(sql).must_equal "SELECT * FROM users WHERE id NOT IN (?, ?)"
+      _(params).must_equal [1, 2]
+      _(q.materialize.size).must_equal 2, "3 of 4 rows excluded"
+    end
+
+    it "emits 1=1 for an empty NOT IN array" do
+      q = Users.where { id != [] }
+      sql, params = Diamond::Compiler::Base.compile(q.table, q.ast)
+      _(sql).must_equal "SELECT * FROM users WHERE 1=1"
+      _(params).must_equal []
+      _(q.materialize.size).must_equal 4, "NOT IN () is tautologically true"
+    end
+
+    it "keeps scalar id != 5 as NotEqual (no array overload)" do
+      q = Users.where { id != 5 }
+      sql, params = Diamond::Compiler::Base.compile(q.table, q.ast)
+      _(sql).must_equal "SELECT * FROM users WHERE id <> ?"
+      _(params).must_equal [5]
+    end
+  end
+
+  # ====================================================================
   describe "::find" do
     it "builds a lazy Where AST" do
       q = Users.find(1)
@@ -207,6 +308,98 @@ describe Diamond do
 
     it "raises RecordNotFound for missing ids" do
       _(proc { Users.find(99999).name }).must_raise Diamond::RecordNotFound
+    end
+  end
+
+  # ====================================================================
+  describe "DDL — FK actions & indexes" do
+    it "emits ON DELETE CASCADE when on_delete: :cascade is given" do
+      ast = Diamond._build_relation(:widgets) do |t|
+        t.attribute :id, Integer, primary_key: true, nullable: false
+        t.attribute :owner_id, Integer
+        t.foreign_key :owner_id, :owners, on_delete: :cascade
+      end
+      sql, _ = Diamond::Compiler::DDL.compile(ast)
+      _(sql).must_match(/ON DELETE CASCADE/)
+    end
+
+    it "emits ON UPDATE SET NULL when on_update: :set_null is given" do
+      ast = Diamond._build_relation(:widgets) do |t|
+        t.attribute :id, Integer, primary_key: true, nullable: false
+        t.attribute :owner_id, Integer
+        t.foreign_key :owner_id, :owners, on_update: :set_null
+      end
+      sql, _ = Diamond::Compiler::DDL.compile(ast)
+      _(sql).must_match(/ON UPDATE SET NULL/)
+    end
+
+    it "omits ON clauses when no action kwargs are given" do
+      ast = Diamond._build_relation(:widgets) do |t|
+        t.attribute :id, Integer, primary_key: true, nullable: false
+        t.attribute :owner_id, Integer
+        t.foreign_key :owner_id, :owners
+      end
+      sql, _ = Diamond::Compiler::DDL.compile(ast)
+      _(sql).wont_match(/ON (DELETE|UPDATE)/)
+    end
+
+    it "raises ArgumentError on unknown on_delete action" do
+      err = assert_raises(ArgumentError) do
+        Diamond._build_relation(:widgets) do |t|
+          t.attribute :id, Integer, primary_key: true, nullable: false
+          t.attribute :owner_id, Integer
+          t.foreign_key :owner_id, :owners, on_delete: :bogus
+        end
+      end
+      _(err.message).must_match(/unknown on_delete/)
+    end
+
+    it "creates a UNIQUE index inline via t.index" do
+      Diamond.define_relation(:widgets) do |t|
+        t.attribute :id, Integer, primary_key: true, nullable: false
+        t.attribute :name, String
+        t.index :name, unique: true, name: :idx_widgets_name
+      end
+      rows = Diamond.engine.db.execute("PRAGMA index_list(widgets)")
+      _(rows.map { |r| r['name'] }).must_include 'idx_widgets_name'
+      row = rows.find { |r| r['name'] == 'idx_widgets_name' }
+      _(row['unique']).must_equal 1
+    end
+
+    it "creates a non-unique index inline via t.index" do
+      Diamond.define_relation(:widgets2) do |t|
+        t.attribute :id, Integer, primary_key: true, nullable: false
+        t.attribute :a, Integer
+        t.attribute :b, Integer
+        t.index :a, :b, name: :idx_w2_ab
+      end
+      row = Diamond.engine.db.execute("PRAGMA index_list(widgets2)").find { |r| r['name'] == 'idx_w2_ab' }
+      _(row).must_be_kind_of Hash
+      _(row['unique']).must_equal 0
+    end
+
+    it "creates an index via top-level Diamond.create_index" do
+      Diamond.define_relation(:widgets3) do |t|
+        t.attribute :id, Integer, primary_key: true, nullable: false
+        t.attribute :a, Integer
+      end
+      Diamond.create_index :widgets3, [:a], unique: true, name: :idx_w3_a
+      row = Diamond.engine.db.execute("PRAGMA index_list(widgets3)").find { |r| r['name'] == 'idx_w3_a' }
+      _(row).must_be_kind_of Hash
+      _(row['unique']).must_equal 1
+    end
+
+    it "rejects Diamond.create_index without a name kwarg" do
+      Diamond.define_relation(:widgets4) do |t|
+        t.attribute :id, Integer, primary_key: true, nullable: false
+      end
+      _(proc { Diamond.create_index :widgets4, [:id] }).must_raise ArgumentError
+    end
+
+    it "auto-enables PRAGMA foreign_keys = ON after wake_up" do
+      Diamond.wake_up(':memory:')
+      row = Diamond.engine.db.execute('PRAGMA foreign_keys').first
+      _(row.values.first).must_equal 1
     end
   end
 
