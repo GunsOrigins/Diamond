@@ -1,45 +1,95 @@
 module Diamond
   module DSL
     module Default
-      # We define this as a module method that takes the context (self)
-      # so it can be included in both Table and QueryObject.
-      
       def where(&block)
-        condition = Diamond::Parser.parse_block(block, _schema_for_dsl)
-        raise "Where block must return an AST condition" unless condition.is_a?(Diamond::AST::Node)
-        
-        _build_query([Diamond::AST::Where.new(condition)])
+        _build_where(&block)
+      end
+
+      def find(id)
+        pk = _schema_for_dsl[:primary_key] || :id
+        condition = Diamond::AST::Equality.new(
+          Diamond::AST::Column.new(pk),
+          Diamond::AST::Literal.new(id)
+        )
+        _build_where_node(condition)
       end
 
       def derive(*args, &block)
-        if block_given?
-          proxy = Diamond::SchemaProxy.new(_schema_for_dsl)
-          node = proxy.instance_eval(&block)
-          raise "Derive block must return an AST node" unless node.is_a?(Diamond::AST::Node)
-          args = [node]
-        end
-        
-        _build_query([Diamond::AST::Projection.new(args)])
+        _build_projection(*args, &block)
       end
 
-      # --- Hooks for the including classes ---
-
-      # Returns the schema to validate against
-      def _schema_for_dsl
-        if self.is_a?(Diamond::Table)
-          @schema
-        else
-          @table.schema
-        end
+      def join(table_name, on: nil, type: :inner)
+        _build_join(table_name, type, on)
       end
 
-      # Returns a new QueryObject with the appended AST
-      def _build_query(nodes)
-        if self.is_a?(Diamond::Table)
-          Diamond::QueryObject.new(self, nodes)
-        else
-          Diamond::QueryObject.new(@table, @ast + nodes)
-        end
+      def define_relation(name, &block)
+        ast = _build_relation(name, &block)
+        sql, params = Diamond::Compiler::DDL.compile(ast)
+        Diamond.engine.db.execute(sql, *params)
+        Diamond.engine.reload_schema!
+        ast
+      end
+
+      def create(**kwargs)
+        _build_create(kwargs)
+      end
+
+      def update(&block)
+        result = _build_update(&block)
+        @cached_result = nil if defined?(@cached_result) && @cached_result
+        result
+      end
+
+      def delete
+        result = _build_delete
+        @cached_result = nil if defined?(@cached_result) && @cached_result
+        result
+      end
+
+      def from_cte(alias_name)
+        Diamond::QueryObject.new(self, [Diamond::AST::From.new(alias_name)])
+      end
+
+      # --- Honey Batch: chaining + terminals ---
+
+      def order(*args, **kwargs)
+        _build_order(*args, **kwargs)
+      end
+
+      def limit(n)
+        _build_limit(n)
+      end
+
+      def offset(n)
+        _build_offset(n)
+      end
+
+      # Terminals delegate to QueryObject. When called on a Table, wrap
+      # it in a fresh QueryObject first.
+      def pluck(*columns)
+        _wrap.pluck(*columns)
+      end
+
+      def exists?
+        _wrap.exists?
+      end
+
+      def count
+        _wrap.count
+      end
+
+      def first(n = 1)
+        _wrap.first(n)
+      end
+
+      def last(n = 1)
+        _wrap.last(n)
+      end
+
+      private
+
+      def _wrap
+        is_a?(Diamond::Table) ? Diamond::QueryObject.new(self) : self
       end
     end
   end

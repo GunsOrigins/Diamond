@@ -2,78 +2,191 @@ require 'prism'
 
 module Diamond
   module Parser
-    @file_cache = {}
-    @ast_cache = {} 
+    WINDOW_FUNCS = [:row_number, :rank, :dense_rank, :lag, :lead].freeze
+    AGGREGATIONS = [:count, :sum, :avg, :min, :max].freeze
+    DDL_METHODS  = [:attribute, :primary_key, :foreign_key].freeze
 
+    @file_cache = {}
+    @where_cache = {}
+    @derive_cache = {}
+    @ddl_cache = {}
+    @update_cache = {}
+
+    # ====================================================================
+    # Where blocks (conditions): single-expression Prism translation.
+    # Returns a single AST::Node.
+    # ====================================================================
     def self.parse_block(block, schema)
+      _parse_with_candidates(block, :where) { |node| translate_where(node, schema) }
+    end
+
+    # ====================================================================
+    # Derive blocks (projections): multi-statement. Returns Array<AST node>.
+    # Supports bare columns, function calls, and window function chains.
+    # ====================================================================
+    def self.parse_derive(block, schema)
+      _parse_with_candidates(block, :derive) do |node|
+        unwrap_statements(node).map { |stmt| translate_derive(stmt, schema) }
+      end
+    end
+
+    # ====================================================================
+    # DDL blocks (define_relation): multi-statement. Returns Array<ColumnDefinition|ForeignKey>.
+    # ====================================================================
+    def self.parse_ddl(block)
+      _parse_with_candidates(block, :ddl) do |node|
+        unwrap_statements(node).map { |stmt| translate_ddl_stmt(stmt) }
+      end
+    end
+
+    # ====================================================================
+    # Update blocks: multi-statement. Returns Hash{Symbol => value}.
+    # Supports both `age 17` (CallNode) and `age = 17` (LocalVariableWriteNode).
+    # ====================================================================
+    def self.parse_update(block, schema)
+      _parse_with_candidates(block, :update) do |node|
+        statements = unwrap_statements(node)
+        hash = {}
+        statements.each do |stmt|
+          case stmt
+          when Prism::LocalVariableWriteNode
+            validate_column!(stmt.name, schema)
+            hash[stmt.name] = literal_value(stmt.value)
+          when Prism::LocalVariableReadNode
+            # Trailing read of an assigned local (e.g. `age = 26; age`).
+            # Silences Ruby's "assigned but unused variable" warning at the
+            # call site. We treat it as a no-op reference; the value is not
+            # used to update any column.
+            next
+          when Prism::CallNode
+            positional, kwargs = split_args(stmt)
+            if stmt.receiver.nil? && positional.size == 1 && kwargs.empty?
+              validate_column!(stmt.name, schema)
+              hash[stmt.name] = literal_value(positional.first)
+            else
+              raise BlockMismatch, "Invalid update statement: #{stmt.inspect}"
+            end
+          else
+            raise BlockMismatch, "Invalid update statement: #{stmt.class}"
+          end
+        end
+        hash
+      end
+    end
+
+    # ====================================================================
+    # Internals
+    # ====================================================================
+
+    # Raised when a candidate BlockNode doesn't match the expected parser shape.
+    # Distinct from validation errors (UnknownColumnError, etc.) which mean
+    # "this IS the right block but the content is invalid".
+    class BlockMismatch < StandardError; end
+
+    def self.cache_for(purpose)
+      case purpose
+      when :where  then @where_cache
+      when :derive then @derive_cache
+      when :ddl    then @ddl_cache
+      when :update then @update_cache
+      end
+    end
+
+    # Canonical block-discovery helper. Walks a Prism AST and returns every
+    # BlockNode starting on `line`. Used by every public parse method.
+    def self.locate_block_nodes(node, line, results = [])
+      return results unless node.respond_to?(:location)
+
+      if node.is_a?(Prism::BlockNode) && node.location.start_line == line
+        results << node
+      end
+
+      if node.compact_child_nodes
+        node.compact_child_nodes.each do |child|
+          locate_block_nodes(child, line, results)
+        end
+      end
+      results
+    end
+
+    # Unified candidate-walker. For chained blocks on the same line (e.g.
+    # `Users.where { ... }.update { ... }`), tries each candidate BlockNode
+    # in source order and returns the first one the translator successfully
+    # parses. Validation errors (UnknownColumnError, etc.) propagate so the
+    # user sees the *real* problem with the right block.
+    def self._parse_with_candidates(block, purpose, &translator)
       file, line = block.source_location
       raise "Cannot parse block without a file source" unless file
 
-      cache_key = [file, line]
-      
-      return @ast_cache[cache_key] if @ast_cache.key?(cache_key)
+      cache = cache_for(purpose)
+      cache_key = [file, line, purpose]
+      return cache[cache_key] if cache.key?(cache_key)
 
       @file_cache[file] ||= Prism.parse_file(file).value
-      block_node = find_block_node(@file_cache[file], line)
-      raise "Could not locate block in AST at #{file}:#{line}" unless block_node
+      candidates = locate_block_nodes(@file_cache[file], line)
 
-      @ast_cache[cache_key] = translate(block_node, schema)
-    end
-
-    def self.find_block_node(node, line)
-      return nil unless node.respond_to?(:location)
-
-      if node.is_a?(Prism::BlockNode) && node.location.start_line == line
-        return node
+      result = nil
+      candidates.each do |candidate|
+        begin
+          result = translator.call(candidate)
+          break
+        rescue BlockMismatch
+          next
+        end
       end
 
-      node.compact_child_nodes.each do |child|
-        found = find_block_node(child, line)
-        return found if found
-      end
-      nil
+      raise "No parseable #{purpose} block found at #{file}:#{line}" if result.nil?
+      cache[cache_key] = result
     end
 
-    def self.translate(node, schema)
+    # Dives through BlockNode/ParenthesesNode to get the inner StatementsNode.
+    # Returns an Array of statement nodes.
+    def self.unwrap_statements(block_node)
+      body = block_node.body
+      body = body.body if body.is_a?(Prism::ParenthesesNode)
+      # body is now StatementsNode
+      body.body.reject { |stmt| stmt.is_a?(Prism::ProgramNode) }
+    end
+
+    # ----- Where translation -----
+    def self.translate_where(node, schema)
       case node
       when Prism::BlockNode
-        # Dive into the block's body (StatementsNode)
-        translate(node.body, schema)
+        translate_where(node.body, schema)
       when Prism::StatementsNode
-        # Execute the first (and usually only) statement in the block
-        translate(node.body.first, schema)
+        translate_where(node.body.first, schema)
       when Prism::ParenthesesNode
-        # Unwrap parentheses like (age > 15)
-        translate(node.body, schema)
+        translate_where(node.body, schema)
       when Prism::CallNode
         if node.name == :proc && node.block
-          translate(node.block, schema)
+          translate_where(node.block, schema)
         elsif node.receiver.nil? && node.arguments.nil?
           validate_column!(node.name, schema)
           AST::Column.new(node.name)
         elsif node.receiver && node.arguments
-          left = translate(node.receiver, schema)
-          right = translate(node.arguments.arguments.first, schema)
-          
+          left = translate_where(node.receiver, schema)
+          right = translate_where(node.arguments.arguments.first, schema)
           case node.name
           when :> then AST::GreaterThan.new(left, right)
           when :< then AST::LessThan.new(left, right)
           when :== then AST::Equality.new(left, right)
           when :"!=" then AST::NotEqual.new(left, right)
-          when :&, :"&&" then AST::And.new(left, right) # Added bitwise & alias
-          when :|, :"||" then AST::Or.new(left, right)  # Added bitwise | alias
+          when :&, :"&&" then AST::And.new(left, right)
+          when :|, :"||" then AST::Or.new(left, right)
           else
-            raise "Unsupported operator: #{node.name}"
+            raise BlockMismatch, "Unsupported operator: #{node.name}"
           end
         else
-          raise "Unsupported call: #{node.inspect}"
+          raise BlockMismatch, "Unsupported call: #{node.inspect}"
         end
       when Prism::AndNode
-        AST::And.new(translate(node.left, schema), translate(node.right, schema))
+        AST::And.new(translate_where(node.left, schema), translate_where(node.right, schema))
       when Prism::OrNode
-        AST::Or.new(translate(node.left, schema), translate(node.right, schema))
+        AST::Or.new(translate_where(node.left, schema), translate_where(node.right, schema))
       when Prism::IntegerNode
         AST::Literal.new(Integer(node.slice))
+      when Prism::FloatNode
+        AST::Literal.new(Float(node.slice))
       when Prism::StringNode
         AST::Literal.new(node.unescaped)
       when Prism::NilNode
@@ -83,22 +196,184 @@ module Diamond
       when Prism::FalseNode
         AST::Literal.new(false)
       else
-        raise "Unsupported Prism AST Node: #{node.class}"
+        raise BlockMismatch, "Unsupported Prism AST Node: #{node.class}"
+      end
+    end
+
+    # ----- Derive translation -----
+    def self.translate_derive(node, schema)
+      case node
+      when Prism::CallNode
+        positional, kwargs = split_args(node)
+
+        if node.receiver.nil? && positional.empty? && kwargs.empty?
+          # Bareword column: `name`
+          validate_column!(node.name, schema)
+          return AST::Column.new(node.name)
+        end
+
+        if node.receiver.nil? && !positional.empty? && kwargs.empty?
+          # Function call: `count(id)`, `sum(age)`
+          args = positional.map { |a| translate_derive(a, schema) }
+          return AST::Function.new(node.name, args)
+        end
+
+        if node.name == :over && node.receiver
+          # Window function chain: `row_number.over(partition_by: :age, order: :id)`
+          inner = node.receiver
+          unless inner.is_a?(Prism::CallNode) && inner.receiver.nil? && inner.arguments.nil?
+            raise BlockMismatch, "Window function receiver must be a bareword call: #{inner.inspect}"
+          end
+          unless WINDOW_FUNCS.include?(inner.name)
+            raise BlockMismatch, "Not a window function: #{inner.name}"
+          end
+          _, kw = split_args(node)
+          partition_by = Array(kw[:partition_by]).map(&:to_sym)
+          order_by = Array(kw[:order]).map(&:to_sym)
+          return AST::WindowFunction.new(inner.name, [], partition_by: partition_by, order_by: order_by)
+        end
+
+        raise BlockMismatch, "Unsupported derive call: #{node.inspect}"
+      when Prism::SymbolNode
+        validate_column!(node.value, schema)
+        AST::Column.new(node.value)
+      when Prism::IntegerNode
+        AST::Literal.new(Integer(node.slice))
+      when Prism::FloatNode
+        AST::Literal.new(Float(node.slice))
+      when Prism::StringNode
+        AST::Literal.new(node.unescaped)
+      when Prism::NilNode
+        AST::Literal.new(nil)
+      when Prism::TrueNode
+        AST::Literal.new(true)
+      when Prism::FalseNode
+        AST::Literal.new(false)
+      else
+        raise BlockMismatch, "Unsupported derive AST node: #{node.class}"
+      end
+    end
+
+    # ----- DDL translation -----
+    def self.translate_ddl_stmt(node)
+      raise BlockMismatch, "DDL statement must be a method call, got #{node.class}" unless node.is_a?(Prism::CallNode)
+      raise BlockMismatch, "Unknown DDL method: #{node.name}" unless DDL_METHODS.include?(node.name)
+
+      positional, kwargs = split_args(node)
+
+      case node.name
+      when :attribute
+        raise "attribute requires name and type" if positional.size < 2
+        name = symbol_value(positional[0])
+        type = translate_type(positional[1])
+        AST::ColumnDefinition.new(name, type, kwargs)
+      when :primary_key
+        raise "primary_key requires a name argument" if positional.empty?
+        name = symbol_value(positional[0])
+        AST::ColumnDefinition.new(name, Integer, primary_key: true, nullable: false)
+      when :foreign_key
+        raise "foreign_key requires local column and ref table" if positional.size < 2
+        local = symbol_value(positional[0])
+        ref_table = symbol_value(positional[1])
+        ref_col = positional[2] ? symbol_value(positional[2]) : :id
+        AST::ForeignKey.new(local, ref_table, ref_col)
+      end
+    end
+
+    # ----- Shared helpers -----
+    # Splits a CallNode's args into positional and keyword hashes.
+    # Returns [positional_array, kwargs_hash].
+    def self.split_args(call_node)
+      return [[], {}] unless call_node.arguments
+
+      positional = []
+      kwargs = {}
+      call_node.arguments.arguments.each do |arg|
+        if arg.is_a?(Prism::KeywordHashNode)
+          arg.elements.each do |assoc|
+            key = kwarg_key(assoc.key)
+            kwargs[key] = literal_value_or_array(assoc.value)
+          end
+        else
+          positional << arg
+        end
+      end
+      [positional, kwargs]
+    end
+
+    def self.kwarg_key(node)
+      case node
+      when Prism::SymbolNode then node.value.to_sym
+      when Prism::StringNode then node.unescaped.to_sym
+      else node.name.to_sym
+      end
+    end
+
+    def self.symbol_value(node)
+      raise "Expected SymbolNode, got #{node.class}" unless node.is_a?(Prism::SymbolNode)
+      node.value
+    end
+
+    def self.translate_type(node)
+      unless node.is_a?(Prism::ConstantReadNode)
+        raise ArgumentError, "Type must be a constant (e.g., Integer, String)"
+      end
+      begin
+        Object.const_get(node.name)
+      rescue NameError
+        type_spellcheck(node.name)
+      end
+    end
+
+    def self.type_spellcheck(name)
+      dictionary = Object.constants.map(&:to_s)
+      suggestions = DidYouMean::SpellChecker.new(dictionary: dictionary).correct(name.to_s)
+      msg = "Unknown type '#{name}'."
+      msg += " Did you mean '#{suggestions.first}'?" unless suggestions.empty?
+      raise ArgumentError, msg
+    end
+
+    def self.extract_keyword_hash(call_node)
+      _, kwargs = split_args(call_node)
+      kwargs
+    end
+
+    def self.literal_value_or_array(node)
+      if node.is_a?(Prism::ArrayNode)
+        node.elements.map { |e| literal_value(e) }
+      else
+        literal_value(node)
+      end
+    end
+
+    def self.literal_value(node)
+      case node
+      when Prism::IntegerNode  then Integer(node.slice)
+      when Prism::FloatNode    then Float(node.slice)
+      when Prism::StringNode   then node.unescaped
+      when Prism::SymbolNode   then node.value
+      when Prism::TrueNode     then true
+      when Prism::FalseNode    then false
+      when Prism::NilNode      then nil
+      when Prism::ConstantReadNode
+        begin
+          Object.const_get(node.name)
+        rescue NameError
+          node.name
+        end
+      else
+        raise "Not a literal value: #{node.class}"
       end
     end
 
     def self.validate_column!(name, schema)
-      # CTE Bypass: If the schema is empty (e.g., querying a CTE), 
-      # we don't know the columns, so allow anything.
       return if schema[:columns].empty?
       return if schema[:columns].include?(name)
 
-      closest = schema[:columns].map(&:to_s)
-      suggestions = DidYouMean::SpellChecker.new(dictionary: closest).correct(name.to_s)
-      
+      dictionary = schema[:columns].map(&:to_s)
+      suggestions = DidYouMean::SpellChecker.new(dictionary: dictionary).correct(name.to_s)
       msg = "Table has no column '#{name}'."
       msg += " Did you mean '#{suggestions.first}'?" unless suggestions.empty?
-      
       raise Diamond::UnknownColumnError, msg
     end
   end

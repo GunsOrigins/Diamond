@@ -78,6 +78,18 @@ module Diamond
       def initialize(columns); @columns = columns; end
     end
 
+    # Joins another table. `type` is :inner, :left, :right, :full.
+    # `on` is a Hash mapping the LOCAL column (key) to the REFERENCED column (value),
+    # e.g. { user_id: :id } — meaning "join ON <other>.user_id = <self>.id".
+    class Join < Node
+      attr_reader :table_name, :type, :on
+      def initialize(table_name, type, on)
+        @table_name = table_name
+        @type = type
+        @on = on
+      end
+    end
+
     # For CTEs (WITH clause)
     class With < Node
       attr_reader :name, :query, :recursive
@@ -85,6 +97,31 @@ module Diamond
         @name = name
         @query = query
         @recursive = recursive
+      end
+    end
+
+    # ORDER BY clause. `specs` is an Array of [column_sym, :asc|:desc] pairs.
+    # Order/Limit/Offset come after WHERE in the emitted SQL.
+    class Order < Node
+      attr_reader :specs
+      def initialize(specs)
+        @specs = specs
+      end
+    end
+
+    # LIMIT clause. Holds the limit integer.
+    class Limit < Node
+      attr_reader :value
+      def initialize(value)
+        @value = value
+      end
+    end
+
+    # OFFSET clause. Holds the offset integer.
+    class Offset < Node
+      attr_reader :value
+      def initialize(value)
+        @value = value
       end
     end
 
@@ -123,6 +160,62 @@ module Diamond
         @right = right
         @operator = operator
       end
+    end
+
+    # --- DDL Nodes (Phase 1) ---
+
+    # Top-level CREATE TABLE node. Holds the table name (Symbol)
+    # and an ordered array of column definitions and foreign keys.
+    class DefineRelation < Node
+      attr_reader :name, :columns
+      def initialize(name, columns)
+        @name = name
+        @columns = columns
+      end
+    end
+
+    # A single column in a CREATE TABLE statement.
+    # `type` is a Ruby class (Integer, String, Float, TrueClass, FalseClass).
+    # `options` is a Hash; recognized keys: :primary_key, :nullable, :default.
+    class ColumnDefinition < Node
+      attr_reader :name, :type, :options
+      def initialize(name, type, options = {})
+        @name = name
+        @type = type
+        @options = options
+      end
+    end
+
+    # Table-level FOREIGN KEY constraint referencing another table.
+    class ForeignKey < Node
+      attr_reader :local_column, :ref_table, :ref_column
+      def initialize(local_column, ref_table, ref_column = :id)
+        @local_column = local_column
+        @ref_table = ref_table
+        @ref_column = ref_column
+      end
+    end
+
+    # --- DML Nodes (Phase 3) ---
+
+    # INSERT INTO statement. `data` is a Hash mapping column name (Symbol) to value.
+    class Insert < Node
+      attr_reader :data
+      def initialize(data)
+        @data = data
+      end
+    end
+
+    # UPDATE statement. `data` is a Hash mapping column name (Symbol) to value.
+    class Update < Node
+      attr_reader :data
+      def initialize(data)
+        @data = data
+      end
+    end
+
+    # DELETE statement marker. The target rows are derived from the QueryObject's WHERE nodes.
+    class Delete < Node
     end
   end
 end

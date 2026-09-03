@@ -2,17 +2,19 @@ require 'sqlite3'
 
 module Diamond
   class Engine
-    attr_reader :db, :schema_cache
+    attr_reader :db, :schema_cache, :foreign_keys
 
     def initialize(db_path)
       @db = SQLite3::Database.new(db_path, results_as_hash: true)
       @schema_cache = {}
-      
+      @foreign_keys = {}
+
       load_schema!
     end
 
     def reload_schema!
       @schema_cache = {}
+      @foreign_keys = {}
       load_schema!
     end
 
@@ -20,10 +22,11 @@ module Diamond
 
     def load_schema!
       tables = @db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
-      
+
       tables.each do |row|
         table_name = row['name'].to_sym
         @schema_cache[table_name] = parse_table_schema(table_name)
+        @foreign_keys[table_name] = parse_foreign_keys(table_name)
       end
     end
 
@@ -44,6 +47,17 @@ module Diamond
         types: types,
         primary_key: primary_key
       }
+    end
+
+    def parse_foreign_keys(table_name)
+      rows = @db.execute("PRAGMA foreign_key_list(#{table_name})")
+      rows.map do |row|
+        {
+          local: row['from'].to_sym,
+          ref_table: row['table'].to_sym,
+          ref_col: row['to'].to_sym
+        }
+      end
     end
   end
 end

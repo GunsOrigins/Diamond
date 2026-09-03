@@ -1,24 +1,41 @@
+require 'sqlite3'
+require 'prism'
+require 'did_you_mean'
+
+require_relative 'diamond/version'
 require_relative 'diamond/engine'
+require_relative 'diamond/ast'
+require_relative 'diamond/parser'
+require_relative 'diamond/null_table'
+require_relative 'diamond/struct_factory'
 require_relative 'diamond/table'
 require_relative 'diamond/query_object'
-require_relative 'diamond/null_table'
-require_relative 'diamond/table_definition'
+require_relative 'diamond/compiler/base'
+require_relative 'diamond/compiler/dql'
+require_relative 'diamond/compiler/ddl'
+require_relative 'diamond/compiler/dml'
+require_relative 'diamond/domains/dql'
+require_relative 'diamond/domains/ddl'
+require_relative 'diamond/domains/dml'
+require_relative 'diamond/domains/cte'
+require_relative 'diamond/domains/dynamic_finders'
+require_relative 'diamond/dsl/default'
 
 module Diamond
   class TableNotFound < StandardError; end
   class RecordNotFound < StandardError; end
   class InertObjectError < StandardError; end
-  
+
   class UnknownColumnError < StandardError
     def self.build(schema, name)
       cols = schema[:columns].map(&:to_s)
 
       spell_checker = DidYouMean::SpellChecker.new(dictionary: cols)
       suggestions = spell_checker.correct(name.to_s)
-      
+
       message = "Table has no column '#{name}'."
       message += " Did you mean '#{suggestions.first}'?" unless suggestions.empty?
-      
+
       new(message)
     end
   end
@@ -27,63 +44,42 @@ module Diamond
 
   def self.wake_up(db_path)
     @engine = Engine.new(db_path)
+
+    Diamond::Table.include(Diamond::DSL::Default)
+    Diamond::Table.include(Diamond::Domains::DQL)
+    Diamond::Table.include(Diamond::Domains::DML)
+    Diamond::Table.include(Diamond::Domains::DynamicFinders)
+
+    Diamond::QueryObject.include(Diamond::DSL::Default)
+    Diamond::QueryObject.include(Diamond::Domains::DQL)
+    Diamond::QueryObject.include(Diamond::Domains::DML)
+    Diamond::QueryObject.include(Diamond::Domains::DynamicFinders)
+
+    Diamond.extend(Diamond::Domains::DDL)
+    Diamond.extend(Diamond::Domains::CTE)
+    Diamond.extend(Diamond::DSL::Default)
   end
 
   def self.engine
     @engine
   end
-
-  # CTE Macro: Diamond.with(alias: query) { Diamond.from(alias) }
-  def self.with(cte_hash)
-    raise "CTE requires a block" unless block_given?
-
-    cte_nodes = cte_hash.map do |alias_name, query_obj|
-      AST::With.new(alias_name, query_obj)
-    end
-
-    # Yield a dummy object to build the main query
-    proxy = Object.new
-    proxy.define_singleton_method(:from) do |alias_name|
-      # We use a dummy table reference; the compiler will override it
-      QueryObject.new(Diamond::NullTable.new(name: alias_name, schema: { columns: [], types: {}, primary_key: nil }), [AST::From.new(alias_name)])
-    end
-    
-    main_query = yield(proxy)
-    
-    # Prepend the WITH nodes to the main query's AST
-    QueryObject.new(main_query.table, cte_nodes + main_query.ast)
-  end
-
-  # Recursive CTE Macro
-  def self.with_recursive(name, base_query, recursive_query)
-    # Pass the QueryObjects directly!
-    union_node = AST::Union.new(base_query, recursive_query)
-    
-    dummy_table = Diamond::NullTable.new(name)
-    
-    QueryObject.new(dummy_table, [AST::With.new(name, union_node, recursive: true)])
-  end
-
-  def self.create_table(name, &block)
-    definition = TableDefinition.new(name)
-    definition.instance_eval(&block)
-    
-    engine.db.execute(definition.to_sql)
-    
-    engine.reload_schema!
-  end
 end
 
-class Module
+# Install the const_missing hook via Module.prepend so we don't trigger
+# the static "method redefined" warning that reopening Module with `def`
+# would emit. Prepend inserts the module into the ancestor chain without
+# replacing the original const_missing.
+module DiamondConstMissing
   def const_missing(name)
     table_sym = name.to_s.downcase.to_sym
-    
-    if Diamond.engine&.schema_cache&.key?(table_sym)
+
+    if Diamond.engine && Diamond.engine.schema_cache.key?(table_sym)
       proxy = Diamond::Table.new(table_sym)
       const_set(name, proxy)
       proxy
     else
-      raise NameError, "uninitialized constant #{name}"
+      super
     end
   end
 end
+Module.prepend(DiamondConstMissing)
