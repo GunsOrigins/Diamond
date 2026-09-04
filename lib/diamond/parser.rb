@@ -417,6 +417,7 @@ module Diamond
     end
 
     def self.validate_column!(name, schema)
+      Diamond.validate_ident!(name, "column name")
       return if schema[:columns].empty?
       return if schema[:columns].include?(name)
 

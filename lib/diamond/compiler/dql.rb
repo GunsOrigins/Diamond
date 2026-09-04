@@ -18,6 +18,7 @@ module Diamond
         with_sql    = render_with(with_clauses, params)
         select_sql  = render_projection(projection, params)
         from_target = from_node ? from_node.name : table.name
+        Diamond.validate_ident!(from_target, "FROM target")
         from_sql    = "FROM #{from_target}"
         joins_sql   = joins.map { |j| render_join(j, from_target) }.join(' ')
         where_sql   = wheres.empty? ? '' : ' WHERE ' + wheres.map { |w| translate_node(w.condition, params) }.join(' AND ')
@@ -72,6 +73,7 @@ module Diamond
       end
 
       def self.render_join(node, current_table)
+        Diamond.validate_ident!(node.table_name, "join table")
         sql_type = JOIN_TYPE_MAP[node.type] || raise(ArgumentError, "Unknown join type: #{node.type}")
         on_clauses = node.on.map do |local, ref|
           "#{node.table_name}.#{local} = #{current_table}.#{ref}"

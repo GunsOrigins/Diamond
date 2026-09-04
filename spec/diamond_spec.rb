@@ -873,6 +873,60 @@ describe Diamond do
   end
 
   # ====================================================================
+  describe "Hardening (Plan A)" do
+    it "leaves the connection usable after a failed materialize" do
+      Diamond.define_relation(:ephemeral) do |t|
+        t.attribute :id, Integer, primary_key: true, nullable: false
+      end
+      q = Ephemeral.where { id == 1 }
+      Diamond.engine.db.execute("DROP TABLE ephemeral")
+      _(proc { q.materialize }).must_raise SQLite3::SQLException
+      _(Users.count).must_equal 4
+    end
+
+    it "rejects malicious identifiers and quotes embedded quotes" do
+      _(proc { Diamond.validate_ident!('users; DROP TABLE users;--', "table name") }).must_raise ArgumentError
+      _(proc { Diamond.validate_ident!('has space', "column name") }).must_raise ArgumentError
+      _(Diamond.quote_ident('a"b')).must_equal '"a""b"'
+    end
+
+    it "does not grow the ancestor chain on repeated wake_up" do
+      before = Diamond::Table.ancestors.count(Diamond::DSL::Default)
+      Diamond.wake_up(':memory:')
+      after = Diamond::Table.ancestors.count(Diamond::DSL::Default)
+      _(before).must_equal 1
+      _(after).must_equal 1
+    end
+
+    it "does not collide struct cache keys across member splits" do
+      col = ->(sym) { Diamond::AST::Column.new(sym) }
+      s1 = Diamond::StructFactory.create(Users, { 'a_b' => 1, 'c' => 2 }, [col.(:a_b), col.(:c)])
+      s2 = Diamond::StructFactory.create(Users, { 'a' => 1, 'b_c' => 2 }, [col.(:a), col.(:b_c)])
+      _(s1.members).must_equal [:a_b, :c]
+      _(s2.members).must_equal [:a, :b_c]
+      _(s1.a_b).must_equal 1
+      _(s2.b_c).must_equal 2
+    end
+
+    it "rebinds table constants to the new engine on re-wake" do
+      _(Users.name).must_equal :users
+      Diamond.wake_up(':memory:')
+      _(Object.const_defined?(:Users, false)).must_equal false
+      Diamond.define_relation(:users) do |t|
+        t.attribute :id, Integer, primary_key: true, nullable: false
+        t.attribute :nick, String
+      end
+      _(Users.schema[:columns]).must_equal [:id, :nick]
+    end
+
+    it "raises NameError for tables missing after re-wake" do
+      _(Users.name).must_equal :users
+      Diamond.wake_up(':memory:')
+      _(proc { Users }).must_raise NameError
+    end
+  end
+
+  # ====================================================================
   # Prism Refactor Invariants
   describe "Prism Refactor Invariants" do
     it "has zero instance_eval calls in lib/" do

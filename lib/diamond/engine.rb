@@ -35,7 +35,7 @@ module Diamond
       types = {}
       primary_key = nil
 
-      @db.execute("PRAGMA table_info(#{table_name})").each do |col|
+      @db.execute("PRAGMA table_info(#{Diamond.quote_ident(table_name)})").each do |col|
         col_name = col['name'].to_sym
         columns << col_name
         types[col_name] = col['type']
@@ -50,7 +50,7 @@ module Diamond
     end
 
     def parse_foreign_keys(table_name)
-      rows = @db.execute("PRAGMA foreign_key_list(#{table_name})")
+      rows = @db.execute("PRAGMA foreign_key_list(#{Diamond.quote_ident(table_name)})")
       rows.map do |row|
         {
           local: row['from'].to_sym,

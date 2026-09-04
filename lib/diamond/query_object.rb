@@ -18,17 +18,24 @@ module Diamond
       sql, params = Diamond::Compiler::Base.compile(@table, @ast)
 
       stmt = Diamond.engine.db.prepare(sql)
-      stmt.bind_params(params)
-      result_set = stmt.execute
+      begin
+        stmt.bind_params(params)
+        result_set = stmt.execute
 
-      projection_node = @ast.find { |n| n.is_a?(AST::Projection) }
-      projected_columns = projection_node&.columns
+        projection_node = @ast.find { |n| n.is_a?(AST::Projection) }
+        projected_columns = projection_node&.columns
 
-      @cached_result = []
-      result_set.each do |row_hash|
-        @cached_result << Diamond::StructFactory.create(@table, row_hash, projected_columns)
+        @cached_result = []
+        result_set.each do |row_hash|
+          @cached_result << Diamond::StructFactory.create(@table, row_hash, projected_columns)
+        end
+      ensure
+        begin
+          stmt.close unless stmt.closed?
+        rescue StandardError
+          # ensure must not raise — close is idempotent via the closed? check
+        end
       end
-      stmt.close
 
       @cached_result
     end

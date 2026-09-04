@@ -878,6 +878,66 @@ class DiamondTest < Minitest::Test
   end
 
   # ====================================================================
+  # Hardening (Plan A)
+  # ====================================================================
+
+  def test_materialize_exception_leaves_connection_usable
+    # Drop the table out from under a built query: materialize must raise,
+    # but the prepared statement must still be closed (ensure), so a
+    # follow-up query on a live table works.
+    Diamond.define_relation(:ephemeral) do |t|
+      t.attribute :id, Integer, primary_key: true, nullable: false
+    end
+    q = Ephemeral.where { id == 1 }
+    Diamond.engine.db.execute("DROP TABLE ephemeral")
+    assert_raises(SQLite3::SQLException) { q.materialize }
+    assert_equal 4, Users.count, "connection still usable after failed materialize"
+  end
+
+  def test_identifier_validation_rejects_malicious_names
+    assert_raises(ArgumentError) do
+      Diamond.validate_ident!('users; DROP TABLE users;--', "table name")
+    end
+    assert_raises(ArgumentError) { Diamond.validate_ident!('has space', "column name") }
+    assert_equal '"a""b"', Diamond.quote_ident('a"b')
+  end
+
+  def test_wake_up_twice_does_not_grow_ancestor_chain
+    before = Diamond::Table.ancestors.count(Diamond::DSL::Default)
+    Diamond.wake_up(':memory:')
+    after = Diamond::Table.ancestors.count(Diamond::DSL::Default)
+    assert_equal 1, before
+    assert_equal 1, after
+  end
+
+  def test_struct_cache_key_no_collision_across_member_splits
+    col = ->(sym) { Diamond::AST::Column.new(sym) }
+    s1 = Diamond::StructFactory.create(Users, { 'a_b' => 1, 'c' => 2 }, [col.(:a_b), col.(:c)])
+    s2 = Diamond::StructFactory.create(Users, { 'a' => 1, 'b_c' => 2 }, [col.(:a), col.(:b_c)])
+    assert_equal [:a_b, :c], s1.members
+    assert_equal [:a, :b_c], s2.members
+    assert_equal 1, s1.a_b
+    assert_equal 2, s2.b_c
+  end
+
+  def test_rewake_rebinds_table_constants_to_new_engine
+    assert_equal :users, Users.name
+    Diamond.wake_up(':memory:')
+    refute Object.const_defined?(:Users, false), "stale Users constant must be removed on re-wake"
+    Diamond.define_relation(:users) do |t|
+      t.attribute :id, Integer, primary_key: true, nullable: false
+      t.attribute :nick, String
+    end
+    assert_equal [:id, :nick], Users.schema[:columns]
+  end
+
+  def test_rewake_missing_table_raises_name_error
+    assert_equal :users, Users.name
+    Diamond.wake_up(':memory:')
+    assert_raises(NameError) { Users }
+  end
+
+  # ====================================================================
   # Prism Refactor Invariants
   # ====================================================================
 

@@ -8,7 +8,10 @@ module Diamond
       members = resolve_members(projection_nodes, table)
 
       member_names = members.map(&:first)
-      cache_key = projection_nodes ? "#{table.name}_#{member_names.join('_')}" : table.name.to_s
+      # NUL separator: member names are Ruby identifiers (validated at parse
+      # time) and can never contain "\0", so ["a_b", "c"] and ["a", "b_c"]
+      # can no longer collide the way '_' joining allowed.
+      cache_key = projection_nodes ? "#{table.name}\0#{member_names.join("\0")}" : table.name.to_s
 
       unless @struct_cache[cache_key]
         @struct_cache[cache_key] = Struct.new(*member_names) do

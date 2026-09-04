@@ -55,6 +55,31 @@ module Diamond
 
   @engine = nil
 
+  IDENT_RE = /\A[a-zA-Z_][a-zA-Z0-9_]*\z/.freeze
+
+  # Double-quote an identifier for interpolation into SQL (PRAGMA paths
+  # read table names back out of sqlite_master, which is DB-controlled
+  # content — never interpolate it raw).
+  def self.quote_ident(name)
+    "\"#{name.to_s.gsub('"', '""')}\""
+  end
+
+  # Reject identifiers that would need quoting anywhere else. Called at
+  # DDL/compile boundaries so emitted SQL stays unquoted (and all existing
+  # SQL-string assertions keep passing) while malicious names fail fast
+  # with a clear error instead of injecting.
+  def self.validate_ident!(name, what = "identifier")
+    unless name.to_s.match?(IDENT_RE)
+      raise ArgumentError, "invalid #{what} #{name.inspect}: must match #{IDENT_RE.inspect}"
+    end
+    name
+  end
+
+  # Tables bound via const_missing (e.g. `Users`) are tracked here so a
+  # later wake_up against a different database can rebind them instead of
+  # leaving them pinned to the previous engine's schema.
+  @bound_tables = []
+
   def self.wake_up(db_path)
     @engine = Engine.new(db_path)
     # Enable FK action clauses (CASCADE / SET NULL / etc.) at the SQLite
@@ -62,19 +87,41 @@ module Diamond
     # `:memory:` databases where the default is OFF.
     @engine.db.execute('PRAGMA foreign_keys = ON')
 
-    Diamond::Table.include(Diamond::DSL::Default)
-    Diamond::Table.include(Diamond::Domains::DQL)
-    Diamond::Table.include(Diamond::Domains::DML)
-    Diamond::Table.include(Diamond::Domains::DynamicFinders)
+    # Idempotent: including an already-included module is a no-op for the
+    # ancestor chain, but each call still busts Ruby's global method cache.
+    # Guard so repeated wake_up (e.g. per-test setup) doesn't pay that.
+    unless Diamond::Table.include?(Diamond::DSL::Default)
+      Diamond::Table.include(Diamond::DSL::Default)
+      Diamond::Table.include(Diamond::Domains::DQL)
+      Diamond::Table.include(Diamond::Domains::DML)
+      Diamond::Table.include(Diamond::Domains::DynamicFinders)
 
-    Diamond::QueryObject.include(Diamond::DSL::Default)
-    Diamond::QueryObject.include(Diamond::Domains::DQL)
-    Diamond::QueryObject.include(Diamond::Domains::DML)
-    Diamond::QueryObject.include(Diamond::Domains::DynamicFinders)
+      Diamond::QueryObject.include(Diamond::DSL::Default)
+      Diamond::QueryObject.include(Diamond::Domains::DQL)
+      Diamond::QueryObject.include(Diamond::Domains::DML)
+      Diamond::QueryObject.include(Diamond::Domains::DynamicFinders)
 
-    Diamond.extend(Diamond::Domains::DDL)
-    Diamond.extend(Diamond::Domains::CTE)
-    Diamond.extend(Diamond::DSL::Default)
+      Diamond.extend(Diamond::Domains::DDL)
+      Diamond.extend(Diamond::Domains::CTE)
+      Diamond.extend(Diamond::DSL::Default)
+    end
+
+    rebind_tables!
+  end
+
+  # Re-resolve previously bound table constants against the new engine's
+  # schema. Constants for tables missing in the new schema are removed so
+  # the next reference raises NameError (via const_missing) instead of
+  # silently serving the old engine's Table.
+  def self.rebind_tables!
+    @bound_tables.each do |const_name|
+      Object.send(:remove_const, const_name) if Object.const_defined?(const_name, false)
+    end
+    @bound_tables.clear
+  end
+
+  def self.note_bound_table(const_name)
+    @bound_tables << const_name unless @bound_tables.include?(const_name)
   end
 
   def self.engine
@@ -92,7 +139,12 @@ module DiamondConstMissing
 
     if Diamond.engine && Diamond.engine.schema_cache.key?(table_sym)
       proxy = Diamond::Table.new(table_sym)
-      const_set(name, proxy)
+      # Bind table proxies globally (::Users), not in the lexical scope
+      # (e.g. DiamondTest::Users when referenced inside a test). Table
+      # proxies are engine-global by design, and rebind_tables! tracks and
+      # removes ::Name constants on re-wake.
+      Object.const_set(name, proxy)
+      Diamond.note_bound_table(name)
       proxy
     else
       super

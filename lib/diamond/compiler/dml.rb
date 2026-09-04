@@ -10,9 +10,16 @@ module Diamond
         params = insert_node.data.values
 
         stmt = Diamond.engine.db.prepare(sql)
-        stmt.bind_params(params)
-        stmt.execute
-        stmt.close
+        begin
+          stmt.bind_params(params)
+          stmt.execute
+        ensure
+          begin
+            stmt.close unless stmt.closed?
+          rescue StandardError
+            # ensure must not raise
+          end
+        end
         Diamond.engine.db.last_insert_row_id
       end
 
@@ -28,9 +35,16 @@ module Diamond
         end
 
         stmt = Diamond.engine.db.prepare(sql)
-        stmt.bind_params(params)
-        stmt.execute
-        stmt.close
+        begin
+          stmt.bind_params(params)
+          stmt.execute
+        ensure
+          begin
+            stmt.close unless stmt.closed?
+          rescue StandardError
+            # ensure must not raise
+          end
+        end
         Diamond.engine.db.changes
       end
 
@@ -43,9 +57,16 @@ module Diamond
         end
 
         stmt = Diamond.engine.db.prepare(sql)
-        stmt.bind_params(params)
-        stmt.execute
-        stmt.close
+        begin
+          stmt.bind_params(params)
+          stmt.execute
+        ensure
+          begin
+            stmt.close unless stmt.closed?
+          rescue StandardError
+            # ensure must not raise
+          end
+        end
         Diamond.engine.db.changes
       end
     end
