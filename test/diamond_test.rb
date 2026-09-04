@@ -986,6 +986,44 @@ class DiamondTest < Minitest::Test
   end
 
   # ====================================================================
+  # Compile and cache equivalence
+  # ====================================================================
+
+  def test_single_pass_compile_matches_expected_sql_for_complex_chain
+    q = Users.where { age > 10 }.order(:name).limit(2).offset(1)
+    q = q.where { name != "Sig" }
+    sql, params = Diamond::Compiler::Base.compile(q.table, q.ast)
+    assert_equal "SELECT * FROM users WHERE age > ? AND name <> ? ORDER BY name ASC LIMIT 2 OFFSET 1", sql
+    assert_equal [10, "Sig"], params
+  end
+
+  def test_numeric_literal_forms_parse_via_node_value
+    q = Users.where { id == 0x10 }
+    _, params = Diamond::Compiler::Base.compile(q.table, q.ast)
+    assert_equal [16], params
+    q = Users.where { id == 1_000 }
+    _, params = Diamond::Compiler::Base.compile(q.table, q.ast)
+    assert_equal [1000], params
+  end
+
+  def test_line_cache_populated_after_parse
+    Users.where { age > 10 }
+    line_cache = Diamond::Parser.instance_variable_get(:@line_cache)
+    refute_empty line_cache, "expected per-line candidate memo to be populated"
+  end
+
+  def test_load_one_table_matches_full_reload
+    Diamond.define_relation(:solo) do |t|
+      t.attribute :id, Integer, primary_key: true, nullable: false
+      t.attribute :v, String
+    end
+    solo_schema = Diamond.engine.schema_cache[:solo].dup
+    Diamond.engine.schema_cache.delete(:solo)
+    Diamond.engine.load_one_table!(:solo)
+    assert_equal solo_schema, Diamond.engine.schema_cache[:solo]
+  end
+
+  # ====================================================================
   # Static parsing invariants
   # ====================================================================
 

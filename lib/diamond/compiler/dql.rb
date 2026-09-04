@@ -9,11 +9,28 @@ module Diamond
       }.freeze
 
       def self.compile(table, ast, params = [])
-        with_clauses = ast.select { |n| n.is_a?(AST::With) }
-        projection   = ast.find { |n| n.is_a?(AST::Projection) }
-        joins        = ast.select { |n| n.is_a?(AST::Join) }
-        wheres       = ast.select { |n| n.is_a?(AST::Where) }
-        from_node    = ast.find { |n| n.is_a?(AST::From) }
+        # Single pass over ast: bucket each node once instead of running a
+        # separate select/find/reverse.find per clause kind (~8 scans).
+        with_clauses = []
+        projection   = nil
+        joins        = []
+        wheres       = []
+        from_node    = nil
+        order_specs  = []
+        limit_node   = nil
+        offset_node  = nil
+        ast.each do |n|
+          case n
+          when AST::With       then with_clauses << n
+          when AST::Projection then projection ||= n
+          when AST::Join       then joins << n
+          when AST::Where      then wheres << n
+          when AST::From       then from_node ||= n
+          when AST::Order      then order_specs.concat(n.specs)
+          when AST::Limit      then limit_node = n
+          when AST::Offset     then offset_node = n
+          end
+        end
 
         with_sql    = render_with(with_clauses, params)
         select_sql  = render_projection(projection, params)
@@ -23,21 +40,18 @@ module Diamond
         joins_sql   = joins.map { |j| render_join(j, from_target) }.join(' ')
         where_sql   = wheres.empty? ? '' : ' WHERE ' + wheres.map { |w| translate_node(w.condition, params) }.join(' AND ')
 
-        # Combine all Order specs across every Order node (if multiple exist).
-        # Last Order in source order wins for tie-breaking semantics; concat is
-        # the documented behavior.
-        order_specs = ast.select { |n| n.is_a?(AST::Order) }.flat_map(&:specs)
+        # Order specs were already combined during bucketing (concat across
+        # every Order node preserves the documented combine behavior).
         order_sql   = order_specs.empty? ? '' : ' ORDER BY ' + order_specs.map { |col, dir| "#{col} #{dir.to_s.upcase}" }.join(', ')
 
-        # Multiple Limit / Offset nodes: last-wins. Values are inlined
-        # rather than bound: _build_limit/_build_offset already guarantee
-        # Integer >= 0, so interpolation is safe, and literal LIMIT/OFFSET
-        # lets older SQLite planners apply limit-pushdown (some builds
-        # reject or misplan bound LIMIT ? / OFFSET ?).
-        limit_node  = ast.reverse.find { |n| n.is_a?(AST::Limit) }
+        # Limit / Offset assigned in source order during the single pass, so
+        # the last node wins. Values are inlined rather than bound:
+        # _build_limit/_build_offset already guarantee Integer >= 0, so
+        # interpolation is safe, and literal LIMIT/OFFSET lets older SQLite
+        # planners apply limit-pushdown (some builds reject or misplan
+        # bound LIMIT ? / OFFSET ?).
         limit_sql   = limit_node ? " LIMIT #{limit_node.value}" : ''
 
-        offset_node = ast.reverse.find { |n| n.is_a?(AST::Offset) }
         offset_sql  = offset_node ? " OFFSET #{offset_node.value}" : ''
 
         sql = "#{with_sql} SELECT #{select_sql} #{from_sql}#{joins_sql.empty? ? '' : ' ' + joins_sql}#{where_sql}#{order_sql}#{limit_sql}#{offset_sql}"

@@ -971,6 +971,43 @@ describe Diamond do
   end
 
   # ====================================================================
+  describe "Compile and cache equivalence" do
+    it "compiles a complex chain identically through the single-pass path" do
+      q = Users.where { age > 10 }.order(:name).limit(2).offset(1)
+      q = q.where { name != "Sig" }
+      sql, params = Diamond::Compiler::Base.compile(q.table, q.ast)
+      _(sql).must_equal "SELECT * FROM users WHERE age > ? AND name <> ? ORDER BY name ASC LIMIT 2 OFFSET 1"
+      _(params).must_equal [10, "Sig"]
+    end
+
+    it "parses hex and underscored integer literals via node value" do
+      q = Users.where { id == 0x10 }
+      _, params = Diamond::Compiler::Base.compile(q.table, q.ast)
+      _(params).must_equal [16]
+      q = Users.where { id == 1_000 }
+      _, params = Diamond::Compiler::Base.compile(q.table, q.ast)
+      _(params).must_equal [1000]
+    end
+
+    it "populates the per-line candidate memo after parsing" do
+      Users.where { age > 10 }
+      line_cache = Diamond::Parser.instance_variable_get(:@line_cache)
+      _(line_cache).wont_be_empty
+    end
+
+    it "loads one table identically to a full reload" do
+      Diamond.define_relation(:solo) do |t|
+        t.attribute :id, Integer, primary_key: true, nullable: false
+        t.attribute :v, String
+      end
+      solo_schema = Diamond.engine.schema_cache[:solo].dup
+      Diamond.engine.schema_cache.delete(:solo)
+      Diamond.engine.load_one_table!(:solo)
+      _(Diamond.engine.schema_cache[:solo]).must_equal solo_schema
+    end
+  end
+
+  # ====================================================================
   # Static parsing invariants
   describe "Static parsing invariants" do
     it "has zero instance_eval calls in lib/" do

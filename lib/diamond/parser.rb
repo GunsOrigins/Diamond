@@ -11,6 +11,7 @@ module Diamond
     @derive_cache = {}
     @ddl_cache = {}
     @update_cache = {}
+    @line_cache = {}
 
     # ====================================================================
     # Where blocks (conditions): single-expression Prism translation.
@@ -92,6 +93,17 @@ module Diamond
       end
     end
 
+    # Memoized block discovery: the full-tree walk in locate_block_nodes is
+    # O(file nodes) per call, so cache the candidate list per [file, line].
+    # All four parse entry points share it — a line used as both `where`
+    # and `derive` still walks only once.
+    def self.candidate_blocks(file, line)
+      key = [file, line]
+      return @line_cache[key] if @line_cache.key?(key)
+      @file_cache[file] ||= Prism.parse_file(file).value
+      @line_cache[key] = locate_block_nodes(@file_cache[file], line)
+    end
+
     # Canonical block-discovery helper. Walks a Prism AST and returns every
     # BlockNode starting on `line`. Used by every public parse method.
     def self.locate_block_nodes(node, line, results = [])
@@ -122,8 +134,7 @@ module Diamond
       cache_key = [file, line, purpose]
       return cache[cache_key] if cache.key?(cache_key)
 
-      @file_cache[file] ||= Prism.parse_file(file).value
-      candidates = locate_block_nodes(@file_cache[file], line)
+      candidates = candidate_blocks(file, line)
 
       result = nil
       candidates.each do |candidate|
@@ -210,9 +221,9 @@ module Diamond
       when Prism::OrNode
         AST::Or.new(translate_where(node.left, schema), translate_where(node.right, schema))
       when Prism::IntegerNode
-        AST::Literal.new(Integer(node.slice))
+        AST::Literal.new(node.value)
       when Prism::FloatNode
-        AST::Literal.new(Float(node.slice))
+        AST::Literal.new(node.value)
       when Prism::StringNode
         AST::Literal.new(node.unescaped)
       when Prism::NilNode
@@ -253,9 +264,10 @@ module Diamond
           unless WINDOW_FUNCS.include?(inner.name)
             raise BlockMismatch, "Not a window function: #{inner.name}"
           end
-          _, kw = split_args(node)
-          partition_by = Array(kw[:partition_by]).map(&:to_sym)
-          order_by = Array(kw[:order]).map(&:to_sym)
+          # Reuse the split_args from the top of this branch (kwargs holds
+          # the already-parsed keyword hash) instead of walking args twice.
+          partition_by = Array(kwargs[:partition_by]).map(&:to_sym)
+          order_by = Array(kwargs[:order]).map(&:to_sym)
           return AST::WindowFunction.new(inner.name, [], partition_by: partition_by, order_by: order_by)
         end
 
@@ -264,9 +276,9 @@ module Diamond
         validate_column!(node.value, schema)
         AST::Column.new(node.value)
       when Prism::IntegerNode
-        AST::Literal.new(Integer(node.slice))
+        AST::Literal.new(node.value)
       when Prism::FloatNode
-        AST::Literal.new(Float(node.slice))
+        AST::Literal.new(node.value)
       when Prism::StringNode
         AST::Literal.new(node.unescaped)
       when Prism::NilNode
@@ -398,8 +410,8 @@ module Diamond
 
     def self.literal_value(node)
       case node
-      when Prism::IntegerNode  then Integer(node.slice)
-      when Prism::FloatNode    then Float(node.slice)
+      when Prism::IntegerNode  then node.value
+      when Prism::FloatNode    then node.value
       when Prism::StringNode   then node.unescaped
       when Prism::SymbolNode   then node.value
       when Prism::TrueNode     then true

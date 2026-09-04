@@ -35,7 +35,7 @@ module Diamond
           Diamond.engine.db.execute(idx_sql, *idx_params)
         end
 
-        Diamond.engine.reload_schema!
+        Diamond.engine.load_one_table!(name)
         ast
       end
 
@@ -47,7 +47,7 @@ module Diamond
         idx = Diamond::AST::IndexDefinition.new(name, columns, unique: !!unique)
         sql, params = Diamond::Compiler::DDL.compile_index(idx, table_name)
         Diamond.engine.db.execute(sql, *params)
-        Diamond.engine.reload_schema!
+        Diamond.engine.load_one_table!(table_name)
         idx
       end
 

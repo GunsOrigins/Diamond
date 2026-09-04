@@ -18,6 +18,15 @@ module Diamond
       load_schema!
     end
 
+    # Incremental refresh for a single table — O(columns + FKs) instead of
+    # O(all tables). Used by define_relation/create_index so DDL-heavy
+    # scripts don't pay a full rescan per table created.
+    def load_one_table!(table_name)
+      sym = table_name.to_sym
+      @schema_cache[sym] = parse_table_schema(sym)
+      @foreign_keys[sym] = parse_foreign_keys(sym)
+    end
+
     private
 
     def load_schema!

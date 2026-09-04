@@ -4,16 +4,25 @@ module Diamond
       FINDER_PREFIX = 'by_'.freeze
       AND_SEPARATOR = '_and_'.freeze
 
+      # Memoized method-name → columns parse. A hot `by_id` loop would
+      # otherwise re-split the same string on every call; the parse is
+      # pure (depends only on the method name), so cache it. Column
+      # *validation* still runs per call against the live schema.
+      FINDER_COLS_CACHE = {}
+
       def method_missing(name, *args, &block)
         method_str = name.to_s
         return super unless method_str.start_with?(FINDER_PREFIX)
 
-        column_strs = method_str.delete_prefix(FINDER_PREFIX).split(AND_SEPARATOR)
-        if column_strs.empty?
-          raise ArgumentError, "Invalid dynamic finder '#{name}': no columns after prefix"
+        columns = FINDER_COLS_CACHE[method_str]
+        unless columns
+          column_strs = method_str.delete_prefix(FINDER_PREFIX).split(AND_SEPARATOR)
+          if column_strs.empty?
+            raise ArgumentError, "Invalid dynamic finder '#{name}': no columns after prefix"
+          end
+          columns = column_strs.map(&:to_sym)
+          FINDER_COLS_CACHE[method_str] = columns
         end
-
-        columns = column_strs.map(&:to_sym)
         unless args.size == columns.size
           raise ArgumentError,
                 "wrong number of arguments for #{name} (given #{args.size}, expected #{columns.size})"
