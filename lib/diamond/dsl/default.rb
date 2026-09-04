@@ -71,7 +71,7 @@ module Diamond
         Diamond::QueryObject.new(self, [Diamond::AST::From.new(alias_name)])
       end
 
-      # --- Honey Batch: chaining + terminals ---
+      # --- Chaining + terminals ---
 
       def order(*args, **kwargs)
         _build_order(*args, **kwargs)

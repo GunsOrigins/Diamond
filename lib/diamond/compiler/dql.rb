@@ -29,14 +29,16 @@ module Diamond
         order_specs = ast.select { |n| n.is_a?(AST::Order) }.flat_map(&:specs)
         order_sql   = order_specs.empty? ? '' : ' ORDER BY ' + order_specs.map { |col, dir| "#{col} #{dir.to_s.upcase}" }.join(', ')
 
-        # Multiple Limit / Offset nodes: last-wins.
+        # Multiple Limit / Offset nodes: last-wins. Values are inlined
+        # rather than bound: _build_limit/_build_offset already guarantee
+        # Integer >= 0, so interpolation is safe, and literal LIMIT/OFFSET
+        # lets older SQLite planners apply limit-pushdown (some builds
+        # reject or misplan bound LIMIT ? / OFFSET ?).
         limit_node  = ast.reverse.find { |n| n.is_a?(AST::Limit) }
-        limit_sql   = limit_node ? ' LIMIT ?' : ''
-        params << limit_node.value if limit_node
+        limit_sql   = limit_node ? " LIMIT #{limit_node.value}" : ''
 
         offset_node = ast.reverse.find { |n| n.is_a?(AST::Offset) }
-        offset_sql  = offset_node ? ' OFFSET ?' : ''
-        params << offset_node.value if offset_node
+        offset_sql  = offset_node ? " OFFSET #{offset_node.value}" : ''
 
         sql = "#{with_sql} SELECT #{select_sql} #{from_sql}#{joins_sql.empty? ? '' : ' ' + joins_sql}#{where_sql}#{order_sql}#{limit_sql}#{offset_sql}"
         sql = sql.strip
@@ -124,7 +126,15 @@ module Diamond
           # BinaryOps, etc. emit their SQL form with no `?` placeholder).
           element_sqls = node.right.map { |r| translate_node(r, params) }
           kw = node.is_a?(AST::NotIn) ? 'NOT IN' : 'IN'
-          "#{translate_node(node.left, [])} #{kw} (#{element_sqls.join(', ')})"
+          left_sql = translate_node(node.left, [])
+          # Chunk large IN lists: SQLite caps bound variables per statement
+          # (SQLITE_LIMIT_VARIABLE_NUMBER — 999 on old builds, 32766 on new).
+          # IN groups OR together; NOT IN groups AND together (De Morgan:
+          # NOT (A OR B) == (NOT A) AND (NOT B)).
+          groups = element_sqls.each_slice(500).map { |g| "#{left_sql} #{kw} (#{g.join(', ')})" }
+          return groups.first if groups.size == 1
+          joiner = node.is_a?(AST::NotIn) ? ' AND ' : ' OR '
+          "(#{groups.join(joiner)})"
         else
           raise "Unknown AST Node: #{node.class}"
         end

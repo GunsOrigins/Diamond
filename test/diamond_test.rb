@@ -642,15 +642,15 @@ class DiamondTest < Minitest::Test
   end
 
   # ====================================================================
-  # Honey Batch: order / limit / offset
+  # order / limit / offset
   # ====================================================================
 
   def test_order_limit_offset_chained_sql
     q = Users.where { age > 10 }.order(:name, age: :desc).limit(5).offset(2)
     assert_kind_of Diamond::QueryObject, q
     sql, params = Diamond::Compiler::Base.compile(q.table, q.ast)
-    assert_equal "SELECT * FROM users WHERE age > ? ORDER BY name ASC, age DESC LIMIT ? OFFSET ?", sql
-    assert_equal [10, 5, 2], params
+    assert_equal "SELECT * FROM users WHERE age > ? ORDER BY name ASC, age DESC LIMIT 5 OFFSET 2", sql
+    assert_equal [10], params
   end
 
   def test_order_with_only_symbols_defaults_to_asc
@@ -721,7 +721,7 @@ class DiamondTest < Minitest::Test
   end
 
   # ====================================================================
-  # Honey Batch: pluck / exists? / count / first / last
+  # pluck / exists? / count / first / last
   # ====================================================================
 
   def test_pluck_single_column_returns_flat_array
@@ -878,7 +878,7 @@ class DiamondTest < Minitest::Test
   end
 
   # ====================================================================
-  # Hardening (Plan A)
+  # Hardening
   # ====================================================================
 
   def test_materialize_exception_leaves_connection_usable
@@ -938,7 +938,55 @@ class DiamondTest < Minitest::Test
   end
 
   # ====================================================================
-  # Prism Refactor Invariants
+  # Chunked IN, inline LIMIT/OFFSET, PK-less terminal errors
+  # ====================================================================
+
+  def test_in_large_list_chunks_into_grouped_or_predicates
+    # 1200 literals can't be written as a static block (the array overload
+    # needs a literal ArrayNode in source), so hand-build the AST directly.
+    # Compiler-level test; the parser path is covered by small lists above.
+    lits = (1..1200).map { |i| Diamond::AST::Literal.new(i) }
+    cond = Diamond::AST::In.new(Diamond::AST::Column.new(:id), lits)
+    q = Diamond::QueryObject.new(Users, [Diamond::AST::Where.new(cond)])
+    sql, params = Diamond::Compiler::Base.compile(q.table, q.ast)
+    assert_equal 2, sql.scan(" OR ").size, "1200 ids → 3 groups of 500/500/200"
+    assert_equal 1200, params.size
+    assert_equal 4, q.materialize.size, "ids 1-4 exist in seed"
+  end
+
+  def test_not_in_large_list_chunks_with_and
+    lits = (1..600).map { |i| Diamond::AST::Literal.new(i) }
+    cond = Diamond::AST::NotIn.new(Diamond::AST::Column.new(:id), lits)
+    q = Diamond::QueryObject.new(Users, [Diamond::AST::Where.new(cond)])
+    sql, params = Diamond::Compiler::Base.compile(q.table, q.ast)
+    assert_match(/NOT IN/, sql)
+    assert_equal 1, sql.scan(" AND ").size, "600 ids → 2 groups joined by AND"
+    assert_equal 600, params.size
+    assert_equal 0, q.materialize.size, "ids 1-4 all excluded"
+  end
+
+  def test_limit_offset_inlined_not_bound
+    q = Users.limit(3).offset(1)
+    sql, params = Diamond::Compiler::Base.compile(q.table, q.ast)
+    assert_match(/LIMIT 3/, sql)
+    assert_match(/OFFSET 1/, sql)
+    assert_equal [], params
+    assert_equal 3, q.materialize.size
+  end
+
+  def test_terminals_on_pkless_table_without_id_raise_clear_error
+    Diamond.define_relation(:kv) do |t|
+      t.attribute :k, String
+      t.attribute :v, String
+    end
+    err = assert_raises(Diamond::UnknownColumnError) { Kv.first }
+    assert_match(/has no column/, err.message)
+    assert_raises(Diamond::UnknownColumnError) { Kv.count }
+    assert_raises(Diamond::UnknownColumnError) { Kv.where { k == "a" }.exists? }
+  end
+
+  # ====================================================================
+  # Static parsing invariants
   # ====================================================================
 
   def test_no_instance_eval_anywhere_in_lib

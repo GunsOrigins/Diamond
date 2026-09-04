@@ -183,7 +183,7 @@ module Diamond
       end
     end
 
-    # --- DDL Nodes (Phase 1) ---
+    # --- DDL Nodes ---
 
     # Top-level CREATE TABLE node. Holds the table name (Symbol)
     # and an ordered array of column definitions and foreign keys.

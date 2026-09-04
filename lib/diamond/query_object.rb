@@ -43,7 +43,7 @@ module Diamond
     # n == 1 returns a single Struct; n > 1 returns an Array of Structs.
     # Auto-injects ORDER BY id ASC only when no Order node exists.
     def first(n = 1)
-      scope = has_order? ? self : order(:id)
+      scope = has_order? ? self : order(default_order_column!)
       results = scope.limit(n).materialize
       n == 1 ? results.first : results
     end
@@ -73,7 +73,7 @@ module Diamond
     # ascending id order (we query DESC then reverse in Ruby).
     # Auto-injects ORDER BY id DESC only when no Order node exists.
     def last(n = 1)
-      scope = has_order? ? self : order([:id, :desc])
+      scope = has_order? ? self : order([default_order_column!, :desc])
       results = scope.limit(n).materialize
       n == 1 ? results.first : results.reverse
     end
@@ -98,7 +98,7 @@ module Diamond
 
     # SELECT <pk> LIMIT 1; cheap existence check.
     def exists?
-      pk  = @table.schema[:primary_key] || :id
+      pk  = resolve_pk!
       col = AST::Column.new(pk)
       filtered = @ast.reject { |n| n.is_a?(AST::Projection) } + [AST::Projection.new([col])]
       Diamond::QueryObject.new(@table, filtered).limit(1).materialize.any?
@@ -107,7 +107,7 @@ module Diamond
     # Equivalent to derive { count(primary_key) }, executed and unwrapped
     # to an Integer. Strips any prior Projection.
     def count
-      pk    = @table.schema[:primary_key] || :id
+      pk    = resolve_pk!
       nodes = [AST::Function.new(:count, [AST::Column.new(pk)])]
       filtered = @ast.reject { |n| n.is_a?(AST::Projection) } + [AST::Projection.new(nodes)]
       Diamond::QueryObject.new(@table, filtered).materialize.first.count_id
@@ -139,6 +139,28 @@ module Diamond
 
     def has_order?
       @ast.any? { |n| n.is_a?(AST::Order) }
+    end
+
+    # The default order/count column (PK, falling back to :id). Raises a
+    # clear UnknownColumnError — with DidYouMean — instead of letting the
+    # compiler emit COUNT(missing) and failing obscurely inside SQLite.
+    def resolve_pk!
+      pk = @table.schema[:primary_key] || :id
+      unless @table.schema[:columns].include?(pk)
+        raise Diamond::UnknownColumnError.build(@table.schema, pk)
+      end
+      pk
+    end
+
+    # first/last auto-inject ORDER BY id when the chain has no Order node.
+    # Same validation concern as resolve_pk!: fail fast with the column
+    # error rather than a bare SQLite "no such column".
+    def default_order_column!
+      col = :id
+      unless @table.schema[:columns].include?(col)
+        raise Diamond::UnknownColumnError.build(@table.schema, col)
+      end
+      col
     end
   end
 end

@@ -645,13 +645,13 @@ describe Diamond do
   end
 
   # ====================================================================
-  describe "Honey Batch: order / limit / offset" do
+  describe "order / limit / offset" do
     it "chains order + limit + offset into a single SQL clause" do
       q = Users.where { age > 10 }.order(:name, age: :desc).limit(5).offset(2)
       _(q).must_be_kind_of Diamond::QueryObject
       sql, params = Diamond::Compiler::Base.compile(q.table, q.ast)
-      _(sql).must_equal "SELECT * FROM users WHERE age > ? ORDER BY name ASC, age DESC LIMIT ? OFFSET ?"
-      _(params).must_equal [10, 5, 2]
+      _(sql).must_equal "SELECT * FROM users WHERE age > ? ORDER BY name ASC, age DESC LIMIT 5 OFFSET 2"
+      _(params).must_equal [10]
     end
 
     it "defaults order directions to ASC for plain symbols" do
@@ -721,7 +721,7 @@ describe Diamond do
   end
 
   # ====================================================================
-  describe "Honey Batch: pluck / exists? / count / first / last" do
+  describe "pluck / exists? / count / first / last" do
     it "pluck(:name) returns a flat array" do
       _(Users.pluck(:name)).must_equal ["Arle", "Carbuncle", "Sig", "High"]
     end
@@ -873,7 +873,7 @@ describe Diamond do
   end
 
   # ====================================================================
-  describe "Hardening (Plan A)" do
+  describe "Hardening" do
     it "leaves the connection usable after a failed materialize" do
       Diamond.define_relation(:ephemeral) do |t|
         t.attribute :id, Integer, primary_key: true, nullable: false
@@ -927,8 +927,52 @@ describe Diamond do
   end
 
   # ====================================================================
-  # Prism Refactor Invariants
-  describe "Prism Refactor Invariants" do
+  describe "Chunked IN, inline LIMIT/OFFSET, PK-less terminal errors" do
+    it "chunks a 1200-element IN list into grouped OR predicates" do
+      lits = (1..1200).map { |i| Diamond::AST::Literal.new(i) }
+      cond = Diamond::AST::In.new(Diamond::AST::Column.new(:id), lits)
+      q = Diamond::QueryObject.new(Users, [Diamond::AST::Where.new(cond)])
+      sql, params = Diamond::Compiler::Base.compile(q.table, q.ast)
+      _(sql.scan(" OR ").size).must_equal 2
+      _(params.size).must_equal 1200
+      _(q.materialize.size).must_equal 4
+    end
+
+    it "chunks a 600-element NOT IN list with AND" do
+      lits = (1..600).map { |i| Diamond::AST::Literal.new(i) }
+      cond = Diamond::AST::NotIn.new(Diamond::AST::Column.new(:id), lits)
+      q = Diamond::QueryObject.new(Users, [Diamond::AST::Where.new(cond)])
+      sql, params = Diamond::Compiler::Base.compile(q.table, q.ast)
+      _(sql).must_match(/NOT IN/)
+      _(sql.scan(" AND ").size).must_equal 1
+      _(params.size).must_equal 600
+      _(q.materialize.size).must_equal 0
+    end
+
+    it "inlines LIMIT/OFFSET as literals, not bound params" do
+      q = Users.limit(3).offset(1)
+      sql, params = Diamond::Compiler::Base.compile(q.table, q.ast)
+      _(sql).must_match(/LIMIT 3/)
+      _(sql).must_match(/OFFSET 1/)
+      _(params).must_equal []
+      _(q.materialize.size).must_equal 3
+    end
+
+    it "raises a clear column error for terminals on PK-less tables without id" do
+      Diamond.define_relation(:kv) do |t|
+        t.attribute :k, String
+        t.attribute :v, String
+      end
+      err = assert_raises(Diamond::UnknownColumnError) { Kv.first }
+      _(err.message).must_match(/has no column/)
+      _(proc { Kv.count }).must_raise Diamond::UnknownColumnError
+      _(proc { Kv.where { k == "a" }.exists? }).must_raise Diamond::UnknownColumnError
+    end
+  end
+
+  # ====================================================================
+  # Static parsing invariants
+  describe "Static parsing invariants" do
     it "has zero instance_eval calls in lib/" do
       offenders = Dir["lib/**/*.rb"].flat_map do |f|
         File.readlines(f).select { |line| line.include?("instance_eval") }
