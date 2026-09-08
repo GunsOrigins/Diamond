@@ -6,24 +6,35 @@ module Diamond
     AGGREGATIONS = [:count, :sum, :avg, :min, :max].freeze
     DDL_METHODS  = [:attribute, :primary_key, :foreign_key, :index].freeze
 
-    @file_cache = {}
     @where_cache = {}
     @derive_cache = {}
     @ddl_cache = {}
     @update_cache = {}
     @line_cache = {}
 
+    # everything the parser remembers lives here. clear_caches! (runs on
+    # reload_schema!) drops it all so DDL-heavy scripts don't leak prism
+    # trees and dev-reload never serves stale ASTs. no whole-file tree
+    # cache on purpose - candidate_blocks indexes once per file, buckets
+    # blocks per line, then lets the tree die.
+    def self.clear_caches!
+      @where_cache = {}
+      @derive_cache = {}
+      @ddl_cache = {}
+      @update_cache = {}
+      @line_cache = {}
+    end
+
     # ====================================================================
-    # Where blocks (conditions): single-expression Prism translation.
-    # Returns a single AST::Node.
+    # where blocks: one expression in, one AST::Node out.
     # ====================================================================
     def self.parse_block(block, schema)
       _parse_with_candidates(block, :where) { |node| translate_where(node, schema) }
     end
 
     # ====================================================================
-    # Derive blocks (projections): multi-statement. Returns Array<AST node>.
-    # Supports bare columns, function calls, and window function chains.
+    # derive blocks: one AST node per statement out. bare columns,
+    # function calls, window chains, all of it.
     # ====================================================================
     def self.parse_derive(block, schema)
       _parse_with_candidates(block, :derive) do |node|
@@ -32,7 +43,7 @@ module Diamond
     end
 
     # ====================================================================
-    # DDL blocks (define_relation): multi-statement. Returns Array<ColumnDefinition|ForeignKey>.
+    # define_relation blocks: ColumnDefinitions, ForeignKeys and Indexes out.
     # ====================================================================
     def self.parse_ddl(block)
       _parse_with_candidates(block, :ddl) do |node|
@@ -41,8 +52,8 @@ module Diamond
     end
 
     # ====================================================================
-    # Update blocks: multi-statement. Returns Hash{Symbol => value}.
-    # Supports both `age 17` (CallNode) and `age = 17` (LocalVariableWriteNode).
+    # update blocks: { col => value } out. `age 17` and `age = 26; age`
+    # both work.
     # ====================================================================
     def self.parse_update(block, schema)
       _parse_with_candidates(block, :update) do |node|
@@ -54,10 +65,8 @@ module Diamond
             validate_column!(stmt.name, schema)
             hash[stmt.name] = literal_value(stmt.value)
           when Prism::LocalVariableReadNode
-            # Trailing read of an assigned local (e.g. `age = 26; age`).
-            # Silences Ruby's "assigned but unused variable" warning at the
-            # call site. We treat it as a no-op reference; the value is not
-            # used to update any column.
+            # trailing `age` in `age = 26; age` keeps ruby from whining
+            # about unused variables. ignored.
             next
           when Prism::CallNode
             positional, kwargs = split_args(stmt)
@@ -79,9 +88,8 @@ module Diamond
     # Internals
     # ====================================================================
 
-    # Raised when a candidate BlockNode doesn't match the expected parser shape.
-    # Distinct from validation errors (UnknownColumnError, etc.) which mean
-    # "this IS the right block but the content is invalid".
+    # wrong block, try the next candidate. different from UnknownColumnError
+    # and friends, which mean right block, bad content.
     class BlockMismatch < StandardError; end
 
     def self.cache_for(purpose)
@@ -93,39 +101,38 @@ module Diamond
       end
     end
 
-    # Memoized block discovery: the full-tree walk in locate_block_nodes is
-    # O(file nodes) per call, so cache the candidate list per [file, line].
-    # All four parse entry points share it — a line used as both `where`
-    # and `derive` still walks only once.
+    # first lookup for a file parses once, walks once, buckets every block
+    # by line. later lines are hash hits. tree dies after indexing - only
+    # per-line block subtrees stick around.
     def self.candidate_blocks(file, line)
       key = [file, line]
       return @line_cache[key] if @line_cache.key?(key)
-      @file_cache[file] ||= Prism.parse_file(file).value
-      @line_cache[key] = locate_block_nodes(@file_cache[file], line)
+      index_file_blocks(file)
+      @line_cache[key] ||= []
     end
 
-    # Canonical block-discovery helper. Walks a Prism AST and returns every
-    # BlockNode starting on `line`. Used by every public parse method.
-    def self.locate_block_nodes(node, line, results = [])
-      return results unless node.respond_to?(:location)
+    def self.index_file_blocks(file)
+      marker = [file, :__indexed__]
+      return if @line_cache.key?(marker)
+      tree = Prism.parse_file(file).value
+      bucket = Hash.new { |h, k| h[k] = [] }
+      collect_blocks_into(tree, bucket)
+      bucket.each { |ln, nodes| @line_cache[[file, ln]] = nodes }
+      @line_cache[marker] = true
+      # `tree` falls out of scope here by design (see clear_caches! note).
+    end
 
-      if node.is_a?(Prism::BlockNode) && node.location.start_line == line
-        results << node
-      end
-
+    def self.collect_blocks_into(node, bucket)
+      return unless node.respond_to?(:location)
+      bucket[node.location.start_line] << node if node.is_a?(Prism::BlockNode)
       if node.compact_child_nodes
-        node.compact_child_nodes.each do |child|
-          locate_block_nodes(child, line, results)
-        end
+        node.compact_child_nodes.each { |c| collect_blocks_into(c, bucket) }
       end
-      results
     end
 
-    # Unified candidate-walker. For chained blocks on the same line (e.g.
-    # `Users.where { ... }.update { ... }`), tries each candidate BlockNode
-    # in source order and returns the first one the translator successfully
-    # parses. Validation errors (UnknownColumnError, etc.) propagate so the
-    # user sees the *real* problem with the right block.
+    # chained blocks on one line (`.where{}.update{}`) all live on the same
+    # line, so try each in order and take the first that parses. real errors
+    # (UnknownColumn etc.) still blow up - only shape mismatches move on.
     def self._parse_with_candidates(block, purpose, &translator)
       file, line = block.source_location
       raise "Cannot parse block without a file source" unless file
@@ -150,8 +157,6 @@ module Diamond
       cache[cache_key] = result
     end
 
-    # Dives through BlockNode/ParenthesesNode to get the inner StatementsNode.
-    # Returns an Array of statement nodes.
     def self.unwrap_statements(block_node)
       body = block_node.body
       body = body.body if body.is_a?(Prism::ParenthesesNode)
@@ -161,6 +166,8 @@ module Diamond
 
     # ----- Where translation -----
     def self.translate_where(node, schema)
+      hook = WhereOperators.call(node, schema)
+      return hook if hook
       case node
       when Prism::BlockNode
         translate_where(node.body, schema)
@@ -169,11 +176,8 @@ module Diamond
       when Prism::ParenthesesNode
         translate_where(node.body, schema)
       when Prism::CallNode
-          # Explicit `.in(1, 2, 3)` form — must be intercepted BEFORE the
-          # binary-operator fallthrough because it's a multi-arg call.
-          # Zero-arg `id.in()` is also handled here (node.arguments is nil).
-          # Receivers must be set; bareword column access goes through the
-          # no-receiver branch below.
+          # `.in()` takes any number of args (including zero), so catch it
+          # before the binary-op path that assumes exactly one.
           if node.name == :in && node.receiver
             lhs  = translate_where(node.receiver, schema)
             vals = node.arguments ? node.arguments.arguments.map { |a| translate_where(a, schema) } : []
@@ -190,13 +194,11 @@ module Diamond
           left      = translate_where(node.receiver, schema)
           right_arg = node.arguments.arguments.first
 
-          # Array overload: id == [1, 2, 3] → AST::In
           if node.name == :== && right_arg.is_a?(Prism::ArrayNode)
             vals = right_arg.elements.map { |e| translate_where(e, schema) }
             return AST::In.new(left, vals)
           end
 
-          # Array overload: id != [1, 2, 3] → AST::NotIn
           if node.name == :"!=" && right_arg.is_a?(Prism::ArrayNode)
             vals = right_arg.elements.map { |e| translate_where(e, schema) }
             return AST::NotIn.new(left, vals)
@@ -239,24 +241,23 @@ module Diamond
 
     # ----- Derive translation -----
     def self.translate_derive(node, schema)
+      hook = DeriveOperators.call(node, schema)
+      return hook if hook
       case node
       when Prism::CallNode
         positional, kwargs = split_args(node)
 
         if node.receiver.nil? && positional.empty? && kwargs.empty?
-          # Bareword column: `name`
           validate_column!(node.name, schema)
           return AST::Column.new(node.name)
         end
 
         if node.receiver.nil? && !positional.empty? && kwargs.empty?
-          # Function call: `count(id)`, `sum(age)`
           args = positional.map { |a| translate_derive(a, schema) }
           return AST::Function.new(node.name, args)
         end
 
         if node.name == :over && node.receiver
-          # Window function chain: `row_number.over(partition_by: :age, order: :id)`
           inner = node.receiver
           unless inner.is_a?(Prism::CallNode) && inner.receiver.nil? && inner.arguments.nil?
             raise BlockMismatch, "Window function receiver must be a bareword call: #{inner.inspect}"
@@ -264,8 +265,7 @@ module Diamond
           unless WINDOW_FUNCS.include?(inner.name)
             raise BlockMismatch, "Not a window function: #{inner.name}"
           end
-          # Reuse the split_args from the top of this branch (kwargs holds
-          # the already-parsed keyword hash) instead of walking args twice.
+          # kwargs already parsed above - don't walk the args twice.
           partition_by = Array(kwargs[:partition_by]).map(&:to_sym)
           order_by = Array(kwargs[:order]).map(&:to_sym)
           return AST::WindowFunction.new(inner.name, [], partition_by: partition_by, order_by: order_by)
@@ -343,8 +343,6 @@ module Diamond
     end
 
     # ----- Shared helpers -----
-    # Splits a CallNode's args into positional and keyword hashes.
-    # Returns [positional_array, kwargs_hash].
     def self.split_args(call_node)
       return [[], {}] unless call_node.arguments
 

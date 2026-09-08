@@ -9,8 +9,7 @@ module Diamond
       }.freeze
 
       def self.compile(table, ast, params = [])
-        # Single pass over ast: bucket each node once instead of running a
-        # separate select/find/reverse.find per clause kind (~8 scans).
+        # one loop over ast instead of ~8 selects. bucket everything, render after.
         with_clauses = []
         projection   = nil
         joins        = []
@@ -40,16 +39,12 @@ module Diamond
         joins_sql   = joins.map { |j| render_join(j, from_target) }.join(' ')
         where_sql   = wheres.empty? ? '' : ' WHERE ' + wheres.map { |w| translate_node(w.condition, params) }.join(' AND ')
 
-        # Order specs were already combined during bucketing (concat across
-        # every Order node preserves the documented combine behavior).
+        # specs already merged up top. one ORDER BY out.
         order_sql   = order_specs.empty? ? '' : ' ORDER BY ' + order_specs.map { |col, dir| "#{col} #{dir.to_s.upcase}" }.join(', ')
 
-        # Limit / Offset assigned in source order during the single pass, so
-        # the last node wins. Values are inlined rather than bound:
-        # _build_limit/_build_offset already guarantee Integer >= 0, so
-        # interpolation is safe, and literal LIMIT/OFFSET lets older SQLite
-        # planners apply limit-pushdown (some builds reject or misplan
-        # bound LIMIT ? / OFFSET ?).
+        # last Limit/Offset node wins. values go in raw, not bound -
+        # _build_limit/_build_offset already checked Integer >= 0, and
+        # old sqlite builds choke on (or misplan) bound LIMIT ?.
         limit_sql   = limit_node ? " LIMIT #{limit_node.value}" : ''
 
         offset_sql  = offset_node ? " OFFSET #{offset_node.value}" : ''
@@ -77,7 +72,6 @@ module Diamond
           right_sql = render_with_query(query.right, params)
           "#{left_sql} #{query.operator} #{right_sql}"
         else
-          # QueryObject
           sub_sql, _ = Diamond::Compiler::Base.compile(query.table, query.ast, params)
           sub_sql
         end
@@ -98,6 +92,8 @@ module Diamond
       end
 
       def self.translate_node(node, params)
+        hook = Operators.call(node, params)
+        return hook if hook
         case node
         when Symbol
           node.to_s
@@ -129,22 +125,16 @@ module Diamond
             "#{left} #{node.operator} #{right}"
           end
         when AST::In, AST::NotIn
-          # Empty array → tautologically false (IN) or true (NOT IN).
-          # SQL disallows `IN ()` / `NOT IN ()` so we substitute a constant
-          # predicate that always evaluates to the right polarity.
+          # no `IN ()` in sql, so empty means `1=0`, empty NOT IN means `1=1`.
           if node.right.empty?
             return node.is_a?(AST::NotIn) ? '1=1' : '1=0'
           end
-          # Emit each element via translate_node — handles Literals (pushes
-          # value to params, emits `?`) AND expression elements (Column refs,
-          # BinaryOps, etc. emit their SQL form with no `?` placeholder).
+          # Elements may be expressions, not just Literals. no `?` then.
           element_sqls = node.right.map { |r| translate_node(r, params) }
           kw = node.is_a?(AST::NotIn) ? 'NOT IN' : 'IN'
           left_sql = translate_node(node.left, [])
-          # Chunk large IN lists: SQLite caps bound variables per statement
-          # (SQLITE_LIMIT_VARIABLE_NUMBER — 999 on old builds, 32766 on new).
-          # IN groups OR together; NOT IN groups AND together (De Morgan:
-          # NOT (A OR B) == (NOT A) AND (NOT B)).
+          # sqlite caps bound vars per statement, so slice big lists into
+          # 500s. IN groups get OR, NOT IN groups get AND (de morgan).
           groups = element_sqls.each_slice(500).map { |g| "#{left_sql} #{kw} (#{g.join(', ')})" }
           return groups.first if groups.size == 1
           joiner = node.is_a?(AST::NotIn) ? ' AND ' : ' OR '

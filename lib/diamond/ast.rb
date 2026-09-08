@@ -1,7 +1,7 @@
 module Diamond
   module AST
     class Node
-      # Logical operators must be on the base Node so any two conditions can be joined
+      # so you can `&` / `|` any two conditions together.
       def &(other)
         AST::And.new(self, other)
       end
@@ -52,9 +52,7 @@ module Diamond
       def initialize(left, right); super(left, right, :'<>'); end
     end
 
-    # `WHERE col IN (v1, v2, v3)`. `left` is typically an AST::Column;
-    # `right` is an Array of AST nodes (usually AST::Literal, but
-    # expressions are allowed too).
+    # `right` may hold expressions, not just literals.
     class In < Node
       attr_reader :left, :right
       def initialize(left, right)
@@ -63,8 +61,6 @@ module Diamond
       end
     end
 
-    # `WHERE col NOT IN (v1, v2, v3)`. Same shape as In; emitted as
-    # `NOT IN` in SQL.
     class NotIn < Node
       attr_reader :left, :right
       def initialize(left, right)
@@ -79,6 +75,10 @@ module Diamond
 
     class LessThan < BinaryOp
       def initialize(left, right); super(left, right, :'<'); end
+    end
+
+    class Like < BinaryOp
+      def initialize(left, right); super(left, right, :LIKE); end
     end
 
     class And < BinaryOp
@@ -99,9 +99,7 @@ module Diamond
       def initialize(columns); @columns = columns; end
     end
 
-    # Joins another table. `type` is :inner, :left, :right, :full.
-    # `on` is a Hash mapping the LOCAL column (key) to the REFERENCED column (value),
-    # e.g. { user_id: :id } — meaning "join ON <other>.user_id = <self>.id".
+    # `on` maps LOCAL col to FOREIGN col, e.g. { user_id: :id }.
     class Join < Node
       attr_reader :table_name, :type, :on
       def initialize(table_name, type, on)
@@ -111,7 +109,6 @@ module Diamond
       end
     end
 
-    # For CTEs (WITH clause)
     class With < Node
       attr_reader :name, :query, :recursive
       def initialize(name, query, recursive: false)
@@ -121,8 +118,7 @@ module Diamond
       end
     end
 
-    # ORDER BY clause. `specs` is an Array of [column_sym, :asc|:desc] pairs.
-    # Order/Limit/Offset come after WHERE in the emitted SQL.
+    # `specs` is [[col, :asc|:desc], ...]. lands after WHERE in the sql.
     class Order < Node
       attr_reader :specs
       def initialize(specs)
@@ -130,7 +126,6 @@ module Diamond
       end
     end
 
-    # LIMIT clause. Holds the limit integer.
     class Limit < Node
       attr_reader :value
       def initialize(value)
@@ -138,7 +133,6 @@ module Diamond
       end
     end
 
-    # OFFSET clause. Holds the offset integer.
     class Offset < Node
       attr_reader :value
       def initialize(value)
@@ -146,13 +140,12 @@ module Diamond
       end
     end
 
-    # To change the FROM target (for querying CTEs)
+    # swap the FROM target (how you query a CTE).
     class From < Node
       attr_reader :name
       def initialize(name); @name = name; end
     end
 
-    # For SQL Functions (COUNT, SUM, AVG, etc.)
     class Function < Node
       attr_reader :name, :args
       def initialize(name, args)
@@ -161,7 +154,6 @@ module Diamond
       end
     end
 
-    # For Window Functions
     class WindowFunction < Node
       attr_reader :func_name, :args, :partition_by, :order_by
 
@@ -173,7 +165,6 @@ module Diamond
       end
     end
 
-    # For Recursive CTEs (UNION ALL)
     class Union < Node
       attr_reader :left, :right, :operator
       def initialize(left, right, operator = "UNION ALL")
@@ -185,8 +176,7 @@ module Diamond
 
     # --- DDL Nodes ---
 
-    # Top-level CREATE TABLE node. Holds the table name (Symbol)
-    # and an ordered array of column definitions and foreign keys.
+    # column order is DDL order.
     class DefineRelation < Node
       attr_reader :name, :columns
       def initialize(name, columns)
@@ -195,9 +185,7 @@ module Diamond
       end
     end
 
-    # A single column in a CREATE TABLE statement.
-    # `type` is a Ruby class (Integer, String, Float, TrueClass, FalseClass).
-    # `options` is a Hash; recognized keys: :primary_key, :nullable, :default.
+    # `type` is a ruby class. `options` knows :primary_key, :nullable, :default.
     class ColumnDefinition < Node
       attr_reader :name, :type, :options
       def initialize(name, type, options = {})
@@ -207,10 +195,8 @@ module Diamond
       end
     end
 
-    # Table-level FOREIGN KEY constraint referencing another table.
-    # `on_delete` / `on_update` are one of: :cascade, :set_null,
-    # :set_default, :restrict, :no_action. `nil` means no action clause
-    # is emitted (DB default).
+    # on_delete/on_update: :cascade, :set_null, :set_default, :restrict,
+    # :no_action. nil leaves the clause out.
     class ForeignKey < Node
       attr_reader :local_column, :ref_table, :ref_column, :on_delete, :on_update
       def initialize(local_column, ref_table, ref_column = :id,
@@ -223,9 +209,8 @@ module Diamond
       end
     end
 
-    # `CREATE [UNIQUE] INDEX name ON table(cols)`. Lifted into AST so
-    # `define_relation` can emit CREATE TABLE then CREATE INDEX in one
-    # transactional sweep.
+    # lifted into the AST so define_relation does CREATE TABLE then
+    # CREATE INDEX in one go.
     class IndexDefinition < Node
       attr_reader :name, :columns, :unique
       def initialize(name, columns, unique: false)
@@ -237,7 +222,7 @@ module Diamond
 
     # --- DML Nodes ---
 
-    # INSERT INTO statement. `data` is a Hash mapping column name (Symbol) to value.
+    # `data`: Hash mapping column name (Symbol) to value.
     class Insert < Node
       attr_reader :data
       def initialize(data)
@@ -245,7 +230,7 @@ module Diamond
       end
     end
 
-    # UPDATE statement. `data` is a Hash mapping column name (Symbol) to value.
+    # `data`: Hash mapping column name (Symbol) to value.
     class Update < Node
       attr_reader :data
       def initialize(data)
@@ -253,7 +238,7 @@ module Diamond
       end
     end
 
-    # DELETE statement marker. The target rows are derived from the QueryObject's WHERE nodes.
+    # rows come from the chain's WHERE nodes.
     class Delete < Node
     end
   end

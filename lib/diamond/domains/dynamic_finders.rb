@@ -4,11 +4,14 @@ module Diamond
       FINDER_PREFIX = 'by_'.freeze
       AND_SEPARATOR = '_and_'.freeze
 
-      # Memoized method-name → columns parse. A hot `by_id` loop would
-      # otherwise re-split the same string on every call; the parse is
-      # pure (depends only on the method name), so cache it. Column
-      # *validation* still runs per call against the live schema.
+      # method name -> columns, cached. the parse is pure (name only),
+      # so a hot `by_id` loop doesn't re-split every call. validation
+      # still runs per call against the live schema.
       FINDER_COLS_CACHE = {}
+
+      def self.clear_caches!
+        FINDER_COLS_CACHE.clear
+      end
 
       def method_missing(name, *args, &block)
         method_str = name.to_s

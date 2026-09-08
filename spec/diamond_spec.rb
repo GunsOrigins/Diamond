@@ -312,7 +312,7 @@ describe Diamond do
   end
 
   # ====================================================================
-  describe "DDL — FK actions & indexes" do
+  describe "DDL - FK actions & indexes" do
     it "emits ON DELETE CASCADE when on_delete: :cascade is given" do
       ast = Diamond._build_relation(:widgets) do |t|
         t.attribute :id, Integer, primary_key: true, nullable: false
@@ -810,7 +810,7 @@ describe Diamond do
   end
 
   # ====================================================================
-  describe "Streaming edge — QueryObject#each (Cursor)" do
+  describe "Streaming edge - QueryObject#each (Cursor)" do
     it "yields frozen Structs when called with a block" do
       yielded = []
       Users.where { age > 10 }.each { |u| yielded << u }
@@ -866,7 +866,7 @@ describe Diamond do
       # follow-up query works, the close was clean (no leaking handle).
       collected = Users.each.first(2)
       _(collected.size).must_equal 2
-      # Independent query on same engine — proves the cursor handled cleanup:
+      # Independent query on same engine - proves the cursor handled cleanup:
       follow_up = Users.count
       _(follow_up).must_equal 4
     end
@@ -1008,6 +1008,45 @@ describe Diamond do
   end
 
   # ====================================================================
+  describe "Cursor and cache behavior" do
+    it "streams the same values materialize returns" do
+      via_each = Users.order(:id).each.map { |u| [u.id, u.name, u.age] }
+      via_mat  = Users.order(:id).materialize.map { |u| [u.id, u.name, u.age] }
+      _(via_each).must_equal via_mat
+    end
+
+    it "streams projected rows identically to materialize" do
+      via_each = Users.where { age > 10 }.derive { id; name }.each.map { |s| [s.id, s.name] }
+      via_mat  = Users.where { age > 10 }.derive { id; name }.materialize.map { |s| [s.id, s.name] }
+      _(via_each).must_equal via_mat
+      _(via_each.size).must_equal 4
+    end
+
+    it "restores hash row mode after streaming" do
+      Users.each.to_a
+      _(Diamond.engine.db.results_as_hash).must_equal true
+      _(Users.count).must_equal 4
+    end
+
+    it "plucks the same values materialize-then-map produces" do
+      _(Users.order(:id).pluck(:name)).must_equal Users.order(:id).materialize.map(&:name)
+      _(Users.order(:id).pluck(:name, :age)).must_equal Users.order(:id).materialize.map { |u| [u.name, u.age] }
+    end
+
+    it "empties every process cache on clear_caches!" do
+      Users.where { age > 10 }
+      Users.by_name("Arle")
+      Users.derive { count(id) }.materialize
+      Diamond.clear_caches!
+      %i[@where_cache @derive_cache @ddl_cache @update_cache @line_cache].each do |ivar|
+        _(Diamond::Parser.instance_variable_get(ivar)).must_be_empty
+      end
+      _(Diamond::StructFactory.instance_variable_get(:@struct_cache)).must_be_empty
+      _(Diamond::Domains::DynamicFinders::FINDER_COLS_CACHE).must_be_empty
+    end
+  end
+
+  # ====================================================================
   # Static parsing invariants
   describe "Static parsing invariants" do
     it "has zero instance_eval calls in lib/" do
@@ -1028,6 +1067,188 @@ describe Diamond do
       Users.where { age > 10 }
       cache = Diamond::Parser.instance_variable_get(:@where_cache)
       _(cache).wont_be_empty
+    end
+  end
+
+  # ====================================================================
+  describe "Operator registry" do
+    before do
+      @saved_where = Diamond::Parser::WhereOperators.handlers.dup
+      @saved_compiler = Diamond::Compiler::Operators.handlers.dup
+    end
+
+    after do
+      Diamond::Parser::WhereOperators.handlers.clear
+      Diamond::Compiler::Operators.handlers.clear
+      @saved_where.each { |h| Diamond::Parser::WhereOperators.handlers << h }
+      @saved_compiler.each { |h| Diamond::Compiler::Operators.handlers << h }
+    end
+
+    it "registers the built-in LIKE operator at load time" do
+      _(Diamond::Parser::WhereOperators.handlers).must_include Diamond::Operators::Like
+      _(Diamond::Compiler::Operators.handlers).must_include Diamond::Operators::Like
+    end
+
+    it "lets an external operator intercept translate_where via the registry" do
+      mod = Module.new do
+        const_set(:PRIORITY, 100)
+        def self.priority; 100; end
+        def self.parse_where(node, schema)
+          return nil unless node.is_a?(Prism::CallNode)
+          return nil unless node.name == :foo_bar_baz
+          Diamond::AST::Equality.new(
+            Diamond::AST::Column.new(:name),
+            Diamond::AST::Literal.new("intercepted")
+          )
+        end
+      end
+
+      Diamond::Parser::WhereOperators.register(mod)
+      q = Users.where { foo_bar_baz }
+      sql, params = Diamond::Compiler::Base.compile(q.table, q.ast)
+      _(sql).must_match(/name = \?/)
+      _(params).must_equal ["intercepted"]
+    end
+
+    it "lets an external operator intercept translate_node via the compiler registry" do
+      mod = Module.new do
+        def self.priority; 100; end
+        def self.handles?(node)
+          node.is_a?(Diamond::AST::Like) && node.left.name == :nickname
+        end
+        def self.render(node, params)
+          "UPPER(#{node.left.name}) LIKE ?"
+        end
+      end
+
+      Diamond::Compiler::Operators.register(mod)
+      left = Diamond::AST::Column.new(:nickname)
+      right = Diamond::AST::Literal.new("A%")
+      node = Diamond::AST::Like.new(left, right)
+      q = Diamond::QueryObject.new(Users, [Diamond::AST::Where.new(node)])
+      sql, _ = Diamond::Compiler::Base.compile(q.table, q.ast)
+      _(sql).must_match(/UPPER\(nickname\) LIKE \?/)
+    end
+  end
+
+  # ====================================================================
+  describe "LIKE operator" do
+    it "parses string RHS as a LIKE pattern" do
+      q = Users.where { name =~ "A%" }
+      where_node = q.ast.first
+      _(where_node).must_be_kind_of Diamond::AST::Where
+      _(where_node.condition).must_be_kind_of Diamond::AST::Like
+      sql, params = Diamond::Compiler::Base.compile(q.table, q.ast)
+      _(sql).must_equal "SELECT * FROM users WHERE name LIKE ?"
+      _(params).must_equal ["A%"]
+    end
+
+    it "materializes matching rows for string RHS" do
+      rows = Users.where { name =~ "A%" }.materialize.map(&:name)
+      _(rows).must_equal ["Arle"]
+    end
+
+    it "translates /^X/ to LIKE 'X%' (starts with)" do
+      sql, params = Diamond::Compiler::Base.compile(
+        Users.where { name =~ /^Ar/ }.table,
+        Users.where { name =~ /^Ar/ }.ast
+      )
+      _(sql).must_equal "SELECT * FROM users WHERE name LIKE ?"
+      _(params).must_equal ["Ar%"]
+    end
+
+    it "translates /X$/ to LIKE '%X' (ends with)" do
+      sql, params = Diamond::Compiler::Base.compile(
+        Users.where { name =~ /le$/ }.table,
+        Users.where { name =~ /le$/ }.ast
+      )
+      _(sql).must_equal "SELECT * FROM users WHERE name LIKE ?"
+      _(params).must_equal ["%le"]
+    end
+
+    it "translates /^X$/ to LIKE 'X' (exact)" do
+      sql, params = Diamond::Compiler::Base.compile(
+        Users.where { name =~ /^Arle$/ }.table,
+        Users.where { name =~ /^Arle$/ }.ast
+      )
+      _(sql).must_equal "SELECT * FROM users WHERE name LIKE ?"
+      _(params).must_equal ["Arle"]
+    end
+
+    it "translates /X/ (no anchors) to LIKE '%X%' (anywhere)" do
+      sql, params = Diamond::Compiler::Base.compile(
+        Users.where { name =~ /arb/ }.table,
+        Users.where { name =~ /arb/ }.ast
+      )
+      _(sql).must_equal "SELECT * FROM users WHERE name LIKE ?"
+      _(params).must_equal ["%arb%"]
+    end
+
+    it "translates .* to %" do
+      sql, params = Diamond::Compiler::Base.compile(
+        Users.where { name =~ /.*le/ }.table,
+        Users.where { name =~ /.*le/ }.ast
+      )
+      # no anchors -> wrap with %..%, .* -> %, body is %le -> wrapped %%le%
+      _(params).must_equal ["%%le%"]
+    end
+
+    it "translates . (unescaped, not part of .*) to _" do
+      sql, params = Diamond::Compiler::Base.compile(
+        Users.where { name =~ /^A.le$/ }.table,
+        Users.where { name =~ /^A.le$/ }.ast
+      )
+      _(params).must_equal ["A_le"]
+    end
+
+    it "honors backslash escapes in the regex source" do
+      sql, params = Diamond::Compiler::Base.compile(
+        Users.where { name =~ /A\.le/ }.table,
+        Users.where { name =~ /A\.le/ }.ast
+      )
+      # \. -> literal . (not a wildcard). No anchors -> %..%
+      _(params).must_equal ["%A.le%"]
+    end
+
+    it "raises with an honest message for character classes" do
+      _(proc { Users.where { name =~ /[abc]/ } }).must_raise ArgumentError
+    end
+
+    it "raises for alternation" do
+      _(proc { Users.where { name =~ /foo|bar/ } }).must_raise ArgumentError
+    end
+
+    it "raises for groups" do
+      _(proc { Users.where { name =~ /(foo)/ } }).must_raise ArgumentError
+    end
+
+    it "raises for {n,m} quantifiers" do
+      _(proc { Users.where { name =~ /a{2,3}/ } }).must_raise ArgumentError
+    end
+
+    it "raises for + quantifier" do
+      _(proc { Users.where { name =~ /a+/ } }).must_raise ArgumentError
+    end
+
+    it "raises for ? quantifier" do
+      _(proc { Users.where { name =~ /colou?r/ } }).must_raise ArgumentError
+    end
+
+    it "materializes end-to-end with regex anchor" do
+      rows = Users.where { name =~ /^Ar/ }.materialize.map(&:name)
+      _(rows).must_equal ["Arle"]
+    end
+
+    it "uses unknown column error for typos on the LHS" do
+      _(proc { Users.where { naem =~ "A%" } }).must_raise Diamond::UnknownColumnError
+    end
+
+    it "is composable with where chains" do
+      base = Users.where { age > 10 }
+      chained = base.where { name =~ /^A/ }
+      sql, params = Diamond::Compiler::Base.compile(chained.table, chained.ast)
+      _(sql).must_equal "SELECT * FROM users WHERE age > ? AND name LIKE ?"
+      _(params).must_equal [10, "A%"]
     end
   end
 end

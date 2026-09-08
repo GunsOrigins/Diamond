@@ -13,7 +13,7 @@ module Diamond
       end
 
       def _build_projection(*args, &block)
-        raise "derive() called twice — use it once on each chain" if self.is_a?(Diamond::QueryObject) && @ast.any? { |n| n.is_a?(AST::Projection) }
+        raise "derive() called twice; use it once on each chain" if self.is_a?(Diamond::QueryObject) && @ast.any? { |n| n.is_a?(AST::Projection) }
 
         nodes = if args.empty? && block_given?
                   Parser.parse_derive(block, _schema_for_dsl)
@@ -65,8 +65,7 @@ module Diamond
         end
         raise ArgumentError, "order requires at least one column" if pairs.empty?
 
-        # Chained Order calls combine into ONE Order node with merged specs.
-        # The compiler then emits a single ORDER BY ... clause.
+        # chained .order calls merge into one Order node, one ORDER BY out.
         if self.is_a?(Diamond::QueryObject) && (existing = @ast.find { |n| n.is_a?(AST::Order) })
           combined = AST::Order.new(existing.specs + pairs)
           Diamond::QueryObject.new(@table, @ast.reject { |n| n.is_a?(AST::Order) } + [combined])
@@ -102,8 +101,7 @@ module Diamond
 
       private
 
-      # Replaces any existing node of `node_class` in the AST, then appends
-      # `new_node`. Used by order/limit/offset so the most-recent call wins.
+      # last call wins.
       def _filter_or_append(node_class, new_node)
         if self.is_a?(Diamond::Table)
           Diamond::QueryObject.new(self, [new_node])

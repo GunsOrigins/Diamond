@@ -27,9 +27,8 @@ module Diamond
         sql, params = Diamond::Compiler::DDL.compile(ast)
         Diamond.engine.db.execute(sql, *params)
 
-        # Any indexes declared inline (`t.index ...`) are emitted after the
-        # table exists. SQLite enforces FKs only when PRAGMA foreign_keys=ON
-        # (auto-enabled by Diamond.wake_up), which is required for cascades.
+        # indexes go after the table exists. needs PRAGMA foreign_keys=ON
+        # for cascades (wake_up turns it on).
         ast.columns.select { |c| c.is_a?(Diamond::AST::IndexDefinition) }.each do |idx|
           idx_sql, idx_params = Diamond::Compiler::DDL.compile_index(idx, name)
           Diamond.engine.db.execute(idx_sql, *idx_params)
@@ -39,8 +38,6 @@ module Diamond
         ast
       end
 
-      # Top-level imperative index creation.
-      #   Diamond.create_index :widgets, [:a, :b], unique: true, name: :idx_widgets_ab
       def create_index(table_name, columns, unique: false, name:)
         raise ArgumentError, "create_index requires `name:` kwarg" unless name
         raise ArgumentError, "create_index requires at least one column" if Array(columns).empty?
@@ -85,8 +82,6 @@ module Diamond
         _build_offset(n)
       end
 
-      # Terminals delegate to QueryObject. When called on a Table, wrap
-      # it in a fresh QueryObject first.
       def pluck(*columns)
         _wrap.pluck(*columns)
       end
@@ -107,9 +102,6 @@ module Diamond
         _wrap.last(n)
       end
 
-      # Streaming edge — yields Structs one at a time via a Cursor (see
-      # lib/diamond/cursor.rb). Returns an Enumerator when called without
-      # a block, so Ruby `lazy`/`.first(n)`/`.each_slice` all work.
       def each(&block)
         _wrap.each(&block)
       end

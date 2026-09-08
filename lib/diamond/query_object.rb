@@ -33,25 +33,19 @@ module Diamond
         begin
           stmt.close unless stmt.closed?
         rescue StandardError
-          # ensure must not raise — close is idempotent via the closed? check
+          # ensure must not raise - close is idempotent via the closed? check
         end
       end
 
       @cached_result
     end
 
-    # n == 1 returns a single Struct; n > 1 returns an Array of Structs.
-    # Auto-injects ORDER BY id ASC only when no Order node exists.
     def first(n = 1)
       scope = has_order? ? self : order(default_order_column!)
       results = scope.limit(n).materialize
       n == 1 ? results.first : results
     end
 
-    # Lazy streaming edge. Returns a Diamond::Cursor (Enumerable) when
-    # called without a block; yields frozen Structs one at a time when
-    # given a block. Opens a fresh SQLite statement each call — no caching
-    # (declarative purity preserved). See lib/diamond/cursor.rb.
     def each(&block)
       compiled_sql, compiled_params = Diamond::Compiler::Base.compile(@table, @ast)
       stmt = Diamond.engine.db.prepare(compiled_sql)
@@ -69,18 +63,13 @@ module Diamond
       end
     end
 
-    # n == 1 returns a single Struct; n > 1 returns an Array of Structs in
-    # ascending id order (we query DESC then reverse in Ruby).
-    # Auto-injects ORDER BY id DESC only when no Order node exists.
     def last(n = 1)
       scope = has_order? ? self : order([default_order_column!, :desc])
       results = scope.limit(n).materialize
       n == 1 ? results.first : results.reverse
     end
 
-    # 1 column → flat array of values; n columns → array of arrays.
-    # Strips any existing Projection from the chain (terminals don't
-    # conflict with prior derives).
+    # skip the structs entirely - read values straight off the cursor.
     def pluck(*columns)
       raise ArgumentError, "pluck requires at least one column" if columns.empty?
       columns.each do |c|
@@ -88,24 +77,52 @@ module Diamond
       end
       new_nodes = columns.map { |c| AST::Column.new(c) }
       filtered = @ast.reject { |n| n.is_a?(AST::Projection) } + [AST::Projection.new(new_nodes)]
-      rows = Diamond::QueryObject.new(@table, filtered).materialize
-      if columns.size == 1
-        rows.map { |s| s.public_send(columns.first) }
-      else
-        rows.map { |s| columns.map { |c| s.public_send(c) } }
+      q = Diamond::QueryObject.new(@table, filtered)
+      sql, params = Diamond::Compiler::Base.compile(q.table, q.ast)
+      stmt = Diamond.engine.db.prepare(sql)
+      begin
+        stmt.bind_params(params)
+        keys = columns.map(&:to_s)
+        if columns.size == 1
+          key = keys.first
+          result = []
+          stmt.execute.each { |row| result << row[key] }
+          result
+        else
+          result = []
+          stmt.execute.each { |row| result << keys.map { |k| row[k] } }
+          result
+        end
+      ensure
+        begin
+          stmt.close unless stmt.closed?
+        rescue StandardError
+          # ensure must not raise
+        end
       end
     end
 
-    # SELECT <pk> LIMIT 1; cheap existence check.
     def exists?
       pk  = resolve_pk!
       col = AST::Column.new(pk)
       filtered = @ast.reject { |n| n.is_a?(AST::Projection) } + [AST::Projection.new([col])]
-      Diamond::QueryObject.new(@table, filtered).limit(1).materialize.any?
+      q = Diamond::QueryObject.new(@table, filtered).limit(1)
+      sql, params = Diamond::Compiler::Base.compile(q.table, q.ast)
+      stmt = Diamond.engine.db.prepare(sql)
+      begin
+        stmt.bind_params(params)
+        found = false
+        stmt.execute.each { |_row| found = true; break }
+        found
+      ensure
+        begin
+          stmt.close unless stmt.closed?
+        rescue StandardError
+          # ensure must not raise
+        end
+      end
     end
 
-    # Equivalent to derive { count(primary_key) }, executed and unwrapped
-    # to an Integer. Strips any prior Projection.
     def count
       pk    = resolve_pk!
       nodes = [AST::Function.new(:count, [AST::Column.new(pk)])]
@@ -141,9 +158,8 @@ module Diamond
       @ast.any? { |n| n.is_a?(AST::Order) }
     end
 
-    # The default order/count column (PK, falling back to :id). Raises a
-    # clear UnknownColumnError — with DidYouMean — instead of letting the
-    # compiler emit COUNT(missing) and failing obscurely inside SQLite.
+    # pk or :id, and it better exist. fail here with a column error
+    # instead of letting sqlite complain about COUNT(missing).
     def resolve_pk!
       pk = @table.schema[:primary_key] || :id
       unless @table.schema[:columns].include?(pk)
@@ -152,9 +168,7 @@ module Diamond
       pk
     end
 
-    # first/last auto-inject ORDER BY id when the chain has no Order node.
-    # Same validation concern as resolve_pk!: fail fast with the column
-    # error rather than a bare SQLite "no such column".
+    # same deal for the implicit ORDER BY id in first/last.
     def default_order_column!
       col = :id
       unless @table.schema[:columns].include?(col)

@@ -4,13 +4,34 @@ module Diamond
   module StructFactory
     @struct_cache = {}
 
+    # struct classes pile up per projection shape. drop them here.
+    def self.clear_caches!
+      @struct_cache = {}
+    end
+
     def self.create(table, row_hash, projection_nodes = nil)
       members = resolve_members(projection_nodes, table)
 
       member_names = members.map(&:first)
-      # NUL separator: member names are Ruby identifiers (validated at parse
-      # time) and can never contain "\0", so ["a_b", "c"] and ["a", "b_c"]
-      # can no longer collide the way '_' joining allowed.
+      klass = struct_class_for(table, member_names, projection_nodes)
+
+      values = members.map { |member, sql_name| row_hash[sql_name] }
+      klass.new(*values).freeze
+    end
+
+    # array rows land positionally, no hash lookups. select order ==
+    # member order, `*` included.
+    def self.create_from_array(table, row_array, projection_nodes = nil)
+      members = resolve_members(projection_nodes, table)
+
+      member_names = members.map(&:first)
+      klass = struct_class_for(table, member_names, projection_nodes)
+
+      klass.new(*row_array).freeze
+    end
+
+    def self.struct_class_for(table, member_names, projection_nodes)
+      # NUL can't appear in identifiers, so [a_b, c] and [a, b_c] stop colliding.
       cache_key = projection_nodes ? "#{table.name}\0#{member_names.join("\0")}" : table.name.to_s
 
       unless @struct_cache[cache_key]
@@ -19,8 +40,7 @@ module Diamond
         end
       end
 
-      values = members.map { |member, sql_name| row_hash[sql_name] }
-      @struct_cache[cache_key].new(*values).freeze
+      @struct_cache[cache_key]
     end
 
     def self.resolve_members(projection_nodes, table)

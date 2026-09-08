@@ -137,7 +137,7 @@ class DiamondTest < Minitest::Test
   end
 
   # ====================================================================
-  # DDL — FK Actions & Indexes
+  # DDL - FK Actions & Indexes
   # ====================================================================
 
   def test_foreign_key_on_delete_cascade_emits_clause
@@ -233,7 +233,7 @@ class DiamondTest < Minitest::Test
   end
 
   # ====================================================================
-  # DQL — Where / Find / Materialize
+  # DQL - Where / Find / Materialize
   # ====================================================================
 
   def test_where_is_lazy_and_returns_query_object
@@ -401,7 +401,7 @@ class DiamondTest < Minitest::Test
   end
 
   # ====================================================================
-  # DQL — Joins
+  # DQL - Joins
   # ====================================================================
 
   def test_auto_join_resolves_fk_via_cache
@@ -425,7 +425,7 @@ class DiamondTest < Minitest::Test
   end
 
   # ====================================================================
-  # DQL — Derive
+  # DQL - Derive
   # ====================================================================
 
   def test_derive_aggregation_emits_count
@@ -443,7 +443,7 @@ class DiamondTest < Minitest::Test
   end
 
   # ====================================================================
-  # DML — Create / Update / Delete
+  # DML - Create / Update / Delete
   # ====================================================================
 
   def test_create_returns_frozen_struct
@@ -468,7 +468,7 @@ class DiamondTest < Minitest::Test
   end
 
   def test_update_block_assignment_form
-    # Trailing `age` is a LocalVariableReadNode — Diamond treats it as a
+    # Trailing `age` is a LocalVariableReadNode - Diamond treats it as a
     # no-op reference, and it silences Ruby's "assigned but unused" warning.
     count = Users.where { id == 3 }.update { age = 26; age }
     assert_equal 1, count
@@ -815,7 +815,7 @@ class DiamondTest < Minitest::Test
   end
 
   # ====================================================================
-  # Streaming Edge — QueryObject#each (returns Enumerable Cursor)
+  # Streaming Edge - QueryObject#each (returns Enumerable Cursor)
   # ====================================================================
 
   def test_each_with_block_yields_frozen_structs
@@ -1021,6 +1021,47 @@ class DiamondTest < Minitest::Test
     Diamond.engine.schema_cache.delete(:solo)
     Diamond.engine.load_one_table!(:solo)
     assert_equal solo_schema, Diamond.engine.schema_cache[:solo]
+  end
+
+  # ====================================================================
+  # Cursor and cache behavior
+  # ====================================================================
+
+  def test_each_matches_materialize_values
+    via_each = Users.order(:id).each.map { |u| [u.id, u.name, u.age] }
+    via_mat  = Users.order(:id).materialize.map { |u| [u.id, u.name, u.age] }
+    assert_equal via_mat, via_each
+  end
+
+  def test_each_with_projection_matches_materialize
+    via_each = Users.where { age > 10 }.derive { id; name }.each.map { |s| [s.id, s.name] }
+    via_mat  = Users.where { age > 10 }.derive { id; name }.materialize.map { |s| [s.id, s.name] }
+    assert_equal via_mat, via_each
+    assert_equal 4, via_each.size
+  end
+
+  def test_each_restores_hash_row_mode_afterwards
+    Users.each.to_a
+    assert_equal true, Diamond.engine.db.results_as_hash
+    assert_equal 4, Users.count
+  end
+
+  def test_pluck_matches_materialize_mapped_values
+    assert_equal Users.order(:id).materialize.map(&:name), Users.order(:id).pluck(:name)
+    assert_equal Users.order(:id).materialize.map { |u| [u.name, u.age] },
+                 Users.order(:id).pluck(:name, :age)
+  end
+
+  def test_clear_caches_empties_all_process_caches
+    Users.where { age > 10 }
+    Users.by_name("Arle")
+    Users.derive { count(id) }.materialize
+    Diamond.clear_caches!
+    %i[@where_cache @derive_cache @ddl_cache @update_cache @line_cache].each do |ivar|
+      assert_empty Diamond::Parser.instance_variable_get(ivar), "#{ivar} should be empty"
+    end
+    assert_empty Diamond::StructFactory.instance_variable_get(:@struct_cache)
+    assert_empty Diamond::Domains::DynamicFinders::FINDER_COLS_CACHE
   end
 
   # ====================================================================
