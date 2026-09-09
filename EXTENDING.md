@@ -29,6 +29,11 @@ Diamond::Parser::WhereOperators.register(Diamond::Operators::MyOp)
 Diamond::Compiler::Operators.register(Diamond::Operators::MyOp)
 ```
 
+Do it from the main Ractor, ideally at load time (like `like.rb` does at
+the bottom of the file). Handler lists are per-Ractor: workers start with
+the built-ins and never see operators registered after they warmed up.
+Same deal as everything else here — each Ractor owns its own state.
+
 ## Priority
 
 Higher `PRIORITY` runs first. Built-in operators are implicit priority 0 — they are the fallthrough. External operators sit above the built-ins and intercept nodes before the built-in case statements see them.

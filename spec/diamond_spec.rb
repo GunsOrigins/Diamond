@@ -1494,7 +1494,7 @@ describe Diamond do
     it "supports .group combined with .includes" do
       q = Users.includes(:posts).group(:age)
       sql, _, _ = Diamond::Compiler::Base.compile(q.table, q.ast)
-      _(sql).must_include "GROUP BY age"
+      _(sql).must_include "GROUP BY users.age"
     end
   end
 end

@@ -122,9 +122,9 @@ module Diamond
                       prefix = "#{from_target}."
                       ' WHERE ' + wheres.map { |w| translate_where_qualified(w.condition, params, prefix) }.join(' AND ')
                     end
-        group_sql = group_by_node ? " GROUP BY #{group_by_node.columns.join(', ')}" : ''
+        group_sql = group_by_node ? " GROUP BY #{group_by_node.columns.map { |c| "#{from_target}.#{c}" }.join(', ')}" : ''
         having_sql = having_node ? ' HAVING ' + translate_where_qualified(having_node.condition, params, "#{from_target}.") : ''
-        order_sql  = order_specs.empty? ? '' : ' ORDER BY ' + order_specs.map { |col, dir| "#{col} #{dir.to_s.upcase}" }.join(', ')
+        order_sql  = order_specs.empty? ? '' : ' ORDER BY ' + order_specs.map { |col, dir| "#{from_target}.#{col} #{dir.to_s.upcase}" }.join(', ')
         limit_sql  = limit_node ? " LIMIT #{limit_node.value}" : ''
         offset_sql = offset_node ? " OFFSET #{offset_node.value}" : ''
 
