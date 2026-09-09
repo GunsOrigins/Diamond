@@ -46,7 +46,7 @@ module Diamond
           AST::And.new(acc, build_equality(pair))
         end
 
-        _append_to_query([AST::Where.new(condition)])
+        _chain(AST::Where.new(condition))
       end
 
       def respond_to_missing?(name, include_private = false)

@@ -1,40 +1,78 @@
 module Diamond
   module Domains
     module DQL
+      # how each chainable node reconciles with the nodes already on the
+      # chain. builders validate args and construct nodes; _chain applies
+      # the strategy. new AST node types declare one line here (unknown
+      # classes accumulate).
+      RECONCILE = {
+        AST::Where      => :accumulate,
+        AST::Join       => :accumulate,
+        AST::With       => :accumulate,
+        AST::Order      => :merge,
+        AST::Limit      => :replace,
+        AST::Offset     => :replace,
+        AST::GroupBy    => :replace,
+        AST::Having     => :replace,
+        AST::Projection => :once
+      }.freeze
+
+      # the one operation every chain call funnels through. wraps a bare
+      # Table into a QueryObject, then reconciles the node into the ast.
+      # `.or` passes strategy: :fold_or explicitly — the single escape
+      # hatch, since folding rewrites history instead of appending.
+      def _chain(node, strategy: nil)
+        strategy ||= RECONCILE.fetch(node.class, :accumulate)
+        table = self.is_a?(Diamond::Table) ? self : @table
+        base  = self.is_a?(Diamond::Table) ? [] : @ast
+        Diamond::QueryObject.new(table, DQL.apply_strategy(strategy, base, node))
+      end
+
+      def self.apply_strategy(strategy, ast, node)
+        case strategy
+        when :accumulate
+          ast + [node]
+        when :replace
+          ast.reject { |n| n.instance_of?(node.class) } + [node]
+        when :merge # Order: concat specs into a single node
+          existing = ast.find { |n| n.is_a?(AST::Order) }
+          merged = AST::Order.new((existing ? existing.specs : []) + node.specs)
+          ast.reject { |n| n.is_a?(AST::Order) } + [merged]
+        when :once # Projection: second one is a usage error
+          raise "derive() called twice; use it once on each chain" if ast.any? { |n| n.is_a?(AST::Projection) }
+
+          ast + [node]
+        when :fold_or # .or: merge into the last Where, else append fresh
+          idx = ast.rindex { |n| n.is_a?(AST::Where) }
+          if idx
+            combined = AST::Or.new(ast[idx].condition, node.condition)
+            duped = ast.dup
+            duped[idx] = AST::Where.new(combined)
+            duped
+          else
+            ast + [node]
+          end
+        end
+      end
+
       def _build_where(&block)
         condition = Parser.parse_block(block, _schema_for_dsl, _scope_for_dsl)
         raise "Where block must return an AST condition" unless condition.is_a?(AST::Node)
-        _append_to_query([AST::Where.new(condition)])
+        _chain(AST::Where.new(condition))
       end
 
       def _build_or_where(&block)
         condition = Parser.parse_block(block, _schema_for_dsl, _scope_for_dsl)
         raise "Or block must return an AST condition" unless condition.is_a?(AST::Node)
-
-        if self.is_a?(Diamond::Table)
-          return Diamond::QueryObject.new(self, [AST::Where.new(condition)])
-        end
-
-        last_where = @ast.rindex { |n| n.is_a?(AST::Where) }
-        if last_where
-          existing = @ast[last_where].condition
-          combined = AST::Or.new(existing, condition)
-          new_ast = @ast.dup
-          new_ast[last_where] = AST::Where.new(combined)
-          Diamond::QueryObject.new(@table, new_ast)
-        else
-          Diamond::QueryObject.new(@table, @ast + [AST::Where.new(condition)])
-        end
+        _chain(AST::Where.new(condition), strategy: :fold_or)
       end
 
       def _build_where_node(condition_node)
         raise "Where node must be an AST::Node" unless condition_node.is_a?(AST::Node)
-        _append_to_query([AST::Where.new(condition_node)])
+        _chain(AST::Where.new(condition_node))
       end
 
       def _build_projection(*args, &block)
-        raise "derive() called twice; use it once on each chain" if self.is_a?(Diamond::QueryObject) && @ast.any? { |n| n.is_a?(AST::Projection) }
-
         nodes = if args.empty? && block_given?
                   Parser.parse_derive(block, _schema_for_dsl)
                 else
@@ -49,14 +87,14 @@ module Diamond
                     end
                   end
                 end
-        _append_to_query([AST::Projection.new(nodes)])
+        _chain(AST::Projection.new(nodes))
       end
 
       def _build_join(table_name, type, on, eager: false)
         if on.nil?
           on = _resolve_join_keys(table_name)
         end
-        _append_to_query([AST::Join.new(table_name, type, on, eager: eager)])
+        _chain(AST::Join.new(table_name, type, on, eager: eager))
       end
 
       # `.includes(:posts)` is sugar for `.join(:posts, eager: true)`.
@@ -96,25 +134,17 @@ module Diamond
         end
         raise ArgumentError, "order requires at least one column" if pairs.empty?
 
-        # chained .order calls merge into one Order node, one ORDER BY out.
-        if self.is_a?(Diamond::QueryObject) && (existing = @ast.find { |n| n.is_a?(AST::Order) })
-          combined = AST::Order.new(existing.specs + pairs)
-          Diamond::QueryObject.new(@table, @ast.reject { |n| n.is_a?(AST::Order) } + [combined])
-        elsif self.is_a?(Diamond::Table)
-          Diamond::QueryObject.new(self, [AST::Order.new(pairs)])
-        else
-          Diamond::QueryObject.new(@table, @ast + [AST::Order.new(pairs)])
-        end
+        _chain(AST::Order.new(pairs))
       end
 
       def _build_limit(n)
         raise ArgumentError, "limit must be Integer >= 0, got #{n.inspect}" unless n.is_a?(Integer) && n >= 0
-        _filter_or_append(AST::Limit, AST::Limit.new(n))
+        _chain(AST::Limit.new(n))
       end
 
       def _build_offset(n)
         raise ArgumentError, "offset must be Integer >= 0, got #{n.inspect}" unless n.is_a?(Integer) && n >= 0
-        _filter_or_append(AST::Offset, AST::Offset.new(n))
+        _chain(AST::Offset.new(n))
       end
 
       def _build_group(columns)
@@ -123,13 +153,13 @@ module Diamond
           raise Diamond::UnknownColumnError.build(_schema_for_dsl, sym) unless _schema_for_dsl[:columns].include?(sym)
           sym
         end
-        _filter_or_append(AST::GroupBy, AST::GroupBy.new(validated))
+        _chain(AST::GroupBy.new(validated))
       end
 
       def _build_having(&block)
         condition = Parser.parse_block(block, _schema_for_dsl, _scope_for_dsl)
         raise "Having block must return an AST condition" unless condition.is_a?(AST::Node)
-        _filter_or_append(AST::Having, AST::Having.new(condition))
+        _chain(AST::Having.new(condition))
       end
 
       # --- Context Hooks (Used by the DSL modules) ---
@@ -152,24 +182,7 @@ module Diamond
         scope
       end
 
-      def _append_to_query(nodes)
-        if self.is_a?(Diamond::Table)
-          Diamond::QueryObject.new(self, nodes)
-        else
-          Diamond::QueryObject.new(@table, @ast + nodes)
-        end
-      end
-
       private
-
-      # last call wins.
-      def _filter_or_append(node_class, new_node)
-        if self.is_a?(Diamond::Table)
-          Diamond::QueryObject.new(self, [new_node])
-        else
-          Diamond::QueryObject.new(@table, @ast.reject { |n| n.is_a?(node_class) } + [new_node])
-        end
-      end
 
       def _resolve_join_keys(target_table)
         current = _current_table_name
