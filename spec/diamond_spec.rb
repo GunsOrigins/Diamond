@@ -1450,6 +1450,53 @@ describe Diamond do
   end
 
   # ====================================================================
+  describe "introspection" do
+    it "to_sql returns sql and params without running" do
+      q = Users.where { age >= 25 }
+      _(q.to_sql).must_equal ["SELECT * FROM users WHERE age >= ?", [25]]
+    end
+
+    it "to_sql covers eager and subquery chains" do
+      sub = Posts.derive(:user_id)
+      q = Users.where_in(:id, sub).includes(:posts)
+      sql, params = q.to_sql
+      _(sql).must_include "IN (SELECT user_id FROM posts)"
+      _(sql).must_include "LEFT OUTER JOIN posts"
+      _(params).must_be_empty
+    end
+
+    it "explain returns plan rows" do
+      rows = Users.where { age >= 25 }.explain
+      _(rows).wont_be_empty
+      _(rows.first[:detail]).must_match(/users/)
+    end
+
+    it "Diamond.tables lists tables" do
+      _(Diamond.tables).must_include :users
+      _(Diamond.tables).must_include :posts
+      _(Diamond.tables).must_equal Diamond.tables.sort
+    end
+
+    it "Table#columns and #primary_key delegate the schema" do
+      _(Users.columns).must_equal [:id, :name, :age]
+      _(Users.primary_key).must_equal :id
+    end
+
+    it "ast_tree dumps the chain" do
+      tree = Users.where { age >= 25 }.ast_tree
+      _(tree).must_equal "Where\n  GreaterEqual\n    Column(age)\n    Literal(25)"
+    end
+
+    it "ast_tree shows nesting and qualified columns" do
+      q = Posts.join(:users)
+      q = q.where { users.name == 'Arle' }
+      tree = q.ast_tree
+      _(tree).must_include "Join(users, inner)"
+      _(tree).must_include "Column(users.name)"
+    end
+  end
+
+  # ====================================================================
   describe "Multi-column joins" do
     before do
       Diamond.define_relation(:order_items) do |t|

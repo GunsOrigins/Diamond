@@ -9,5 +9,15 @@ module Diamond
       @name = name
       @schema = Diamond.engine.schema_cache[name]
     end
+
+    # column names in DDL order.
+    def columns
+      @schema[:columns]
+    end
+
+    # primary key column, or nil.
+    def primary_key
+      @schema[:primary_key]
+    end
   end
 end

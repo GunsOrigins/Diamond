@@ -175,6 +175,27 @@ module Diamond
       end
     end
 
+    # the SQL this chain compiles to, without running it. returns
+    # [sql, params] — params stay separate so you can bind them yourself.
+    def to_sql
+      sql, params, _transform = Diamond::Compiler::Base.compile(@table, @ast)
+      [sql, params]
+    end
+
+    # sqlite's query plan for this chain. read-only, runs on the
+    # caller's own connection so it works from worker ractors too.
+    # returns extralite rows (:selectid, :order, :from, :detail).
+    def explain
+      sql, params, _transform = Diamond::Compiler::Base.compile(@table, @ast)
+      Diamond.engine.db.query("EXPLAIN QUERY PLAN #{sql}", *params)
+    end
+
+    # the chain's AST as an indented tree. for staring at what a block
+    # actually became.
+    def ast_tree
+      @ast.map { |n| AST.dump(n) }.join("\n")
+    end
+
     private
 
     def has_order?

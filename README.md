@@ -46,6 +46,25 @@ Posts.where_in(:blog_id, followed).includes(:likes).order(id: :desc).limit(10).m
 results are frozen structs. no save method — write through the table.
 `pluck`, `count`, `exists?`, `first`, `last`, `each` all there.
 
+## looking under the hood
+
+```ruby
+q = Posts.where { age >= 16 }
+q.to_sql   # => ["SELECT * FROM posts WHERE age >= ?", [16]]
+q.explain  # => [{id: 2, parent: 0, notused: 0, detail: "SCAN posts"}]
+puts q.ast_tree
+# Where
+#   GreaterEqual
+#     Column(age)
+#     Literal(16)
+
+Diamond.tables   # => [:blogs, :follows, :likes, :posts, :tags]
+Posts.columns    # => [:id, :blog_id, :kind, :body, ...]
+Posts.primary_key # => :id
+```
+
+`to_sql` never runs anything. `explain` is read-only.
+
 ## ractors
 
 every ractor gets its own connection. tables are shareable constants so
@@ -67,8 +86,8 @@ pass values through `find` args, keep literals in the block.
 
 ## limits
 
-- one block per line. the parser buckets blocks by line, two on one line
-  collide. normal formatting and you never hit it.
+- blocks on one line resolve in call order. still, one per line reads
+  better.
 - filtering on joined columns needs `table.column` refs, join first:
   `Posts.join(:tags).where { tags.tag == 'x' }`. barewords still mean
   the base table.

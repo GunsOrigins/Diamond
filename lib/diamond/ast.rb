@@ -303,5 +303,85 @@ module Diamond
     # rows come from the chain's WHERE nodes.
     class Delete < Node
     end
+
+    # indented tree dump for staring at what a block became. one line
+    # per node, children indented two spaces. QueryObject#ast_tree maps
+    # this over the chain.
+    def self.dump(node, indent = 0)
+      pad = '  ' * indent
+      label = case node
+              when Column
+                node.table ? "Column(#{node.table}.#{node.name})" : "Column(#{node.name})"
+              when Literal
+                "Literal(#{node.value.inspect})"
+              when BinaryOp
+                node.class.name.split('::').last
+              when In, NotIn
+                "#{node.class.name.split('::').last}(#{node.right.size} vals)"
+              when IsNull, IsNotNull
+                node.class.name.split('::').last
+              when Between
+                'Between'
+              when Not
+                'Not'
+              when Subquery
+                'Subquery'
+              when Function
+                "#{node.name}(#{node.args.size} args)"
+              when WindowFunction
+                "#{node.func_name} OVER"
+              when Where
+                'Where'
+              when Projection
+                "Projection(#{node.columns.size} cols)"
+              when Join
+                "Join(#{node.table_name}, #{node.type}#{node.eager ? ', eager' : ''})"
+              when Order
+                "Order(#{node.specs.map { |c, d| "#{c} #{d}" }.join(', ')})"
+              when Limit
+                "Limit(#{node.value})"
+              when Offset
+                "Offset(#{node.value})"
+              when GroupBy
+                "GroupBy(#{node.columns.join(', ')})"
+              when Having
+                'Having'
+              when From
+                "From(#{node.name})"
+              when With
+                "With(#{node.name}#{node.recursive ? ', recursive' : ''})"
+              when Union
+                "Union(#{node.operator})"
+              else
+                node.class.name.split('::').last
+              end
+      lines = ["#{pad}#{label}"]
+      kids = case node
+             when BinaryOp then [node.left, node.right]
+             when In, NotIn then [node.left] + (node.right.is_a?(Array) ? node.right : [node.right])
+             when IsNull, IsNotNull then [node.column]
+             when Between then [node.column, node.low, node.high]
+             when Not then [node.condition]
+             when Function then node.args
+             when Where, Having then [node.condition]
+             when Projection then node.columns
+             when Union then [node.left, node.right]
+             else []
+             end
+      kids.each do |k|
+        lines << (k.is_a?(Node) ? dump(k, indent + 1) : "#{pad}  #{k.inspect}")
+      end
+      # With/Subquery hold whole queries — a Union node or a QueryObject
+      # carrying a chain. dump whichever it is.
+      if node.is_a?(With) || node.is_a?(Subquery)
+        q = node.query
+        if q.is_a?(Node)
+          lines << dump(q, indent + 1)
+        else
+          q.ast.each { |n| lines << dump(n, indent + 1) }
+        end
+      end
+      lines.join("\n")
+    end
   end
 end

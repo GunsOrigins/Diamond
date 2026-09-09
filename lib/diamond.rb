@@ -171,6 +171,11 @@ module Diamond
     end
   end
 
+  # table names the calling Ractor's engine knows about, sorted.
+  def self.tables
+    engine.schema_cache.keys.sort
+  end
+
   # drop everything derived from the old schema. runs on reload_schema!.
   # per-Ractor: clears only the calling Ractor's parser/struct/finder
   # caches. operator registries are untouched (use their `clear!`).
