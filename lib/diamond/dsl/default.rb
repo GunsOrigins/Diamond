@@ -5,6 +5,12 @@ module Diamond
         _build_where(&block)
       end
 
+      # chain `.or { condition }` to OR the last where clause with the new one
+      # `Users.where { name == 'Arle' }.or { age > 10 }` => `WHERE name = ? OR age > ?`
+      def or(&block)
+        _build_or_where(&block)
+      end
+
       def find(id)
         pk = _schema_for_dsl[:primary_key] || :id
         condition = Diamond::AST::Equality.new(
@@ -14,12 +20,45 @@ module Diamond
         _build_where_node(condition)
       end
 
+      # `where_sub(:col, query_object)` creates a WHERE col IN (SELECT ...) condition.
+      # `Users.where_sub(:id, Posts.select(:user_id))` compiles to
+      # `SELECT * FROM users WHERE id IN (SELECT user_id FROM posts)`.
+      def where_sub(column, subquery)
+        col_node = AST::Column.new(column)
+        sub_node = AST::Subquery.new(subquery)
+        condition = AST::In.new(col_node, sub_node)
+        _build_where_node(condition)
+      end
+
       def derive(*args, &block)
         _build_projection(*args, &block)
       end
 
-      def join(table_name, on: nil, type: :inner)
-        _build_join(table_name, type, on)
+      # `select(:col1, :col2)` creates a projection for use as a subquery.
+      # `Users.where { id.in(Posts.select(:user_id)) }` compiles to
+      # `SELECT * FROM users WHERE id IN (SELECT user_id FROM posts)`.
+      def select(*columns)
+        nodes = columns.map do |c|
+          if c.is_a?(Symbol)
+            unless _schema_for_dsl[:columns].include?(c)
+              raise Diamond::UnknownColumnError.build(_schema_for_dsl, c)
+            end
+            AST::Column.new(c)
+          else
+            c
+          end
+        end
+        _append_to_query([AST::Projection.new(nodes)])
+      end
+
+      def join(table_name, on: nil, type: :inner, eager: false)
+        _build_join(table_name, type, on, eager: eager)
+      end
+
+      # `.includes(:posts, :comments)` eager-loads child relations.
+      # sugar for `.join(:posts, eager: true).join(:comments, eager: true)`.
+      def includes(*tables)
+        _build_includes(*tables)
       end
 
       def define_relation(name, &block)
@@ -80,6 +119,14 @@ module Diamond
 
       def offset(n)
         _build_offset(n)
+      end
+
+      def group(*columns)
+        _build_group(columns)
+      end
+
+      def having(&block)
+        _build_having(&block)
       end
 
       def pluck(*columns)

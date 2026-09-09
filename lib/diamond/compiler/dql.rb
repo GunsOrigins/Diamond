@@ -18,6 +18,8 @@ module Diamond
         order_specs  = []
         limit_node   = nil
         offset_node  = nil
+        group_by_node = nil
+        having_node  = nil
         ast.each do |n|
           case n
           when AST::With       then with_clauses << n
@@ -28,16 +30,28 @@ module Diamond
           when AST::Order      then order_specs.concat(n.specs)
           when AST::Limit      then limit_node = n
           when AST::Offset     then offset_node = n
+          when AST::GroupBy    then group_by_node = n
+          when AST::Having     then having_node = n
           end
+        end
+
+        from_target = from_node ? from_node.name : table.name
+        Diamond.validate_ident!(from_target, "FROM target")
+
+        # if any join is eager, we need aliased columns + a transform spec
+        # so the result rows can be deduplicated and nested.
+        has_eager = joins.any?(&:eager)
+        if has_eager
+          return compile_eager(table, from_target, projection, joins, wheres, order_specs, with_clauses, limit_node, offset_node, params)
         end
 
         with_sql    = render_with(with_clauses, params)
         select_sql  = render_projection(projection, params)
-        from_target = from_node ? from_node.name : table.name
-        Diamond.validate_ident!(from_target, "FROM target")
         from_sql    = "FROM #{from_target}"
         joins_sql   = joins.map { |j| render_join(j, from_target) }.join(' ')
         where_sql   = wheres.empty? ? '' : ' WHERE ' + wheres.map { |w| translate_node(w.condition, params) }.join(' AND ')
+        group_sql   = group_by_node ? " GROUP BY #{group_by_node.columns.join(', ')}" : ''
+        having_sql  = having_node ? ' HAVING ' + translate_node(having_node.condition, params) : ''
 
         # specs already merged up top. one ORDER BY out.
         order_sql   = order_specs.empty? ? '' : ' ORDER BY ' + order_specs.map { |col, dir| "#{col} #{dir.to_s.upcase}" }.join(', ')
@@ -49,9 +63,183 @@ module Diamond
 
         offset_sql  = offset_node ? " OFFSET #{offset_node.value}" : ''
 
-        sql = "#{with_sql} SELECT #{select_sql} #{from_sql}#{joins_sql.empty? ? '' : ' ' + joins_sql}#{where_sql}#{order_sql}#{limit_sql}#{offset_sql}"
+        sql = "#{with_sql} SELECT #{select_sql} #{from_sql}#{joins_sql.empty? ? '' : ' ' + joins_sql}#{where_sql}#{group_sql}#{having_sql}#{order_sql}#{limit_sql}#{offset_sql}"
         sql = sql.strip
-        [sql, params]
+        [sql, params, nil]
+      end
+
+      # eager-loading path: build a SELECT with aliased columns (table.col AS
+      # "table.col") so the Extralite::Transform can disambiguate which table
+      # a column belongs to, then return the transform spec alongside SQL.
+      def self.compile_eager(table, from_target, projection, joins, wheres, order_specs, with_clauses, limit_node, offset_node, params)
+        # 1. column list: parent cols (with optional projection) + aliased
+        #    columns from each eager join
+        parent_cols = if projection
+                        projection.columns.map { |c| member_column(c) }.compact
+                      else
+                        table.schema[:columns]
+                      end
+
+        select_parts = []
+        # parent: bare column names. Extralite returns them as keys like
+        # "id", "name", etc. The transform spec keys must match these.
+        parent_cols.each do |col|
+          select_parts << "#{from_target}.#{col}"
+        end
+        # children: alias each column as "table.col" so the transform can
+        # tell parent columns from child columns with the same name (e.g.
+        # both tables have an "id" column).
+        joins.each do |j|
+          next unless j.eager
+          child_table = j.table_name
+          child_schema = Diamond.engine.schema_cache[child_table]
+          child_schema[:columns].each do |col|
+            select_parts << "#{child_table}.#{col} AS \"#{child_table}.#{col}\""
+          end
+        end
+        select_sql = select_parts.join(', ')
+
+        # 2. JOIN clauses. eager joins get rewritten to LEFT OUTER JOIN so
+        #    parents without children still appear.
+        render_join_eager = ->(j) {
+          sql_type = (j.eager ? 'LEFT OUTER JOIN' : JOIN_TYPE_MAP[j.type])
+          Diamond.validate_ident!(j.table_name, "join table")
+          on_clauses = j.on.map do |local, ref|
+            "#{j.table_name}.#{local} = #{from_target}.#{ref}"
+          end
+          "#{sql_type} #{j.table_name} ON #{on_clauses.join(' AND ')}"
+        }
+        joins_sql = joins.map { |j| render_join_eager.call(j) }.join(' ')
+
+        # 3. WHERE, ORDER BY, LIMIT, OFFSET. when the query is eager, qualify
+        #    bare column names in WHERE/ORDER BY with the parent table name
+        #    so they don't collide with child table columns.
+        where_sql = if wheres.empty?
+                      ''
+                    else
+                      # eager mode always qualifies bare columns
+                      prefix = "#{from_target}."
+                      ' WHERE ' + wheres.map { |w| translate_where_qualified(w.condition, params, prefix) }.join(' AND ')
+                    end
+        order_sql  = order_specs.empty? ? '' : ' ORDER BY ' + order_specs.map { |col, dir| "#{col} #{dir.to_s.upcase}" }.join(', ')
+        limit_sql  = limit_node ? " LIMIT #{limit_node.value}" : ''
+        offset_sql = offset_node ? " OFFSET #{offset_node.value}" : ''
+
+        with_sql = render_with(with_clauses, params)
+        sql = "#{with_sql} SELECT #{select_sql} FROM #{from_target}#{joins_sql.empty? ? '' : ' ' + joins_sql}#{where_sql}#{order_sql}#{limit_sql}#{offset_sql}".strip
+
+        # 4. build the transform spec
+        transform = build_transform(from_target, table, parent_cols, joins)
+
+        [sql, params, transform]
+      end
+
+      # AST column -> underlying column name (only Column nodes; ignore
+      # Function/WindowFunction in eager mode for now).
+      def self.member_column(node)
+        case node
+        when AST::Column then node.name
+        end
+      end
+
+      def self.build_transform(from_target, table, parent_cols, joins)
+        # build a hash describing the expected row layout. The Extralite
+        # transform expects the spec wrapped in { columns: { ... } } and
+        # uses each spec key as the lookup key against the result set's
+        # column name. We alias child columns as "table.col" so the
+        # transform can disambiguate when parent and child share column
+        # names like "id".
+        eager_joins = joins.select(&:eager)
+        columns_spec = {}
+
+        parent_cols.each do |col|
+          type = type_for_column(from_target, col)
+          columns_spec[col.to_s] = { type: type }
+        end
+
+        eager_joins.each do |j|
+          child_table = j.table_name
+          child_schema = Diamond.engine.schema_cache[child_table]
+          child_columns = {}
+          child_schema[:columns].each do |col|
+            type = type_for_column(child_table, col)
+            child_columns["#{child_table}.#{col}"] = { type: type }
+          end
+          # mark primary key for dedup
+          pk = child_schema[:primary_key]
+          child_columns["#{child_table}.#{pk}"][:identity] = true if pk
+
+          columns_spec[child_table.to_s] = [{
+            type: :relation,
+            columns: child_columns
+          }]
+        end
+
+        # parent primary key for dedup at the parent level
+        pk = table.schema[:primary_key]
+        columns_spec[pk.to_s][:identity] = true if pk
+
+        { columns: columns_spec }
+      end
+
+      def self.type_for_column(table, column)
+        # map sqlite type strings (INTEGER, TEXT, REAL) to extralite
+        # transform types. default to text for unknown types.
+        type_str = Diamond.engine.schema_cache[table][:types][column]
+        case type_str
+        when 'INTEGER' then :integer
+        when 'REAL'    then :float
+        else :text
+        end
+      end
+
+      # Like translate_node but qualifies bare Column references with `prefix`.
+      # Used by eager-mode WHERE/ORDER BY so unqualified columns don't
+      # collide with child table columns in the JOIN.
+      def self.translate_where_qualified(node, params, prefix)
+        case node
+        when AST::Column
+          "#{prefix}#{node.name}"
+        when AST::IsNull
+          "#{translate_where_qualified(node.column, params, prefix)} IS NULL"
+        when AST::IsNotNull
+          "#{translate_where_qualified(node.column, params, prefix)} IS NOT NULL"
+        when AST::Between
+          col_sql = translate_where_qualified(node.column, params, prefix)
+          low_sql = translate_where_qualified(node.low, params, prefix)
+          high_sql = translate_where_qualified(node.high, params, prefix)
+          "#{col_sql} BETWEEN #{low_sql} AND #{high_sql}"
+        when AST::BinaryOp
+          left  = translate_where_qualified(node.left, params, prefix)
+          right = translate_where_qualified(node.right, params, prefix)
+          if [:AND, :OR].include?(node.operator)
+            "(#{left} #{node.operator} #{right})"
+          else
+            "#{left} #{node.operator} #{right}"
+          end
+        when AST::Literal
+          params << node.value
+          '?'
+        when AST::In, AST::NotIn
+          if node.right.empty?
+            return node.is_a?(AST::NotIn) ? '1=1' : '1=0'
+          end
+          element_sqls = node.right.map { |r| translate_where_qualified(r, params, prefix) }
+          kw = node.is_a?(AST::NotIn) ? 'NOT IN' : 'IN'
+          left_sql = translate_where_qualified(node.left, params, prefix)
+          element_sqls = element_sqls.each_slice(500).map { |g| "#{left_sql} #{kw} (#{g.join(', ')})" }
+          element_sqls.size == 1 ? element_sqls.first : "(#{element_sqls.join(kw == 'IN' ? ' OR ' : ' AND ')})"
+        when AST::AndNode
+          left  = translate_where_qualified(node.left, params, prefix)
+          right = translate_where_qualified(node.right, params, prefix)
+          "(#{left} AND #{right})"
+        when AST::OrNode
+          left  = translate_where_qualified(node.left, params, prefix)
+          right = translate_where_qualified(node.right, params, prefix)
+          "(#{left} OR #{right})"
+        else
+          translate_node(node, params)
+        end
       end
 
       def self.render_with(with_nodes, params)
@@ -102,6 +290,18 @@ module Diamond
         when AST::Literal
           params << node.value
           '?'
+        when AST::Subquery
+          sub_sql, _ = Diamond::Compiler::Base.compile(node.query.table, node.query.ast, params)
+          "(#{sub_sql})"
+        when AST::IsNull
+          "#{translate_node(node.column, params)} IS NULL"
+        when AST::IsNotNull
+          "#{translate_node(node.column, params)} IS NOT NULL"
+        when AST::Between
+          col_sql = translate_node(node.column, params)
+          low_sql = translate_node(node.low, params)
+          high_sql = translate_node(node.high, params)
+          "#{col_sql} BETWEEN #{low_sql} AND #{high_sql}"
         when AST::Function
           args_str = node.args.map { |a| translate_node(a, params) }.join(', ')
           "#{node.name}(#{args_str})"
@@ -125,6 +325,13 @@ module Diamond
             "#{left} #{node.operator} #{right}"
           end
         when AST::In, AST::NotIn
+          # subquery form: `col IN (SELECT ...)`
+          if node.right.is_a?(AST::Subquery)
+            left_sql  = translate_node(node.left, params)
+            right_sql = translate_node(node.right, params)
+            kw = node.is_a?(AST::NotIn) ? 'NOT IN' : 'IN'
+            return "#{left_sql} #{kw} #{right_sql}"
+          end
           # no `IN ()` in sql, so empty means `1=0`, empty NOT IN means `1=1`.
           if node.right.empty?
             return node.is_a?(AST::NotIn) ? '1=1' : '1=0'

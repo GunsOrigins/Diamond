@@ -1,10 +1,11 @@
 module Diamond
-  # streams rows out of a prepared statement, one frozen struct at a time.
+  # streams rows out of a prepared Extralite statement, one frozen struct at a time.
   #
-  # statement gets closed by `ensure` when you're done (or break, or blow
-  # up), plus a GC finalizer for cursors you just drop on the floor. the
-  # finalizer is built by ::make_finalizer so it never closes over the
-  # cursor itself.
+  # statement gets closed by `ensure` when iteration completes (or breaks, or
+  # raises), plus a GC finalizer for cursors dropped on the floor. the
+  # finalizer is built by ::make_finalizer so it never closes over the cursor
+  # itself. rows arrive as arrays (positions match the SELECT order), avoiding
+  # hash allocation per row.
   class Cursor
     include Enumerable
 
@@ -28,23 +29,15 @@ module Diamond
 
     def each
       return self unless block_given?
-      db = Diamond.engine.db
-      prev_hash_mode = db.results_as_hash
-      # array rows, not hashes - half the garbage per row. values land
-      # positionally (select order == member order, `*` included).
-      # flips a process-global flag for the loop; single connection so
-      # nobody else can interleave here. ensure flips it back.
-      db.results_as_hash = false
       begin
-        @stmt.execute.each do |row_array|
-          yield Diamond::StructFactory.create_from_array(@table, row_array, @projected_columns)
+        @stmt.each do |row|
+          if row.is_a?(Hash)
+            yield Diamond::StructFactory.create(@table, row, @projected_columns)
+          else
+            yield Diamond::StructFactory.create_from_array(@table, row, @projected_columns)
+          end
         end
       ensure
-        begin
-          db.results_as_hash = prev_hash_mode
-        rescue StandardError
-          # restore must not raise
-        end
         begin
           @stmt.close unless @stmt.closed?
         rescue StandardError

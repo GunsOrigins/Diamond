@@ -69,6 +69,12 @@ module Diamond
       end
     end
 
+    # Wraps a QueryObject as a SQL subquery: `(SELECT ...)`.
+    class Subquery < Node
+      attr_reader :query
+      def initialize(query); @query = query; end
+    end
+
     class GreaterThan < BinaryOp
       def initialize(left, right); super(left, right, :'>'); end
     end
@@ -79,6 +85,25 @@ module Diamond
 
     class Like < BinaryOp
       def initialize(left, right); super(left, right, :LIKE); end
+    end
+
+    class IsNull < Node
+      attr_reader :column
+      def initialize(column); @column = column; end
+    end
+
+    class IsNotNull < Node
+      attr_reader :column
+      def initialize(column); @column = column; end
+    end
+
+    class Between < Node
+      attr_reader :column, :low, :high
+      def initialize(column, low, high)
+        @column = column
+        @low = low
+        @high = high
+      end
     end
 
     class And < BinaryOp
@@ -100,12 +125,17 @@ module Diamond
     end
 
     # `on` maps LOCAL col to FOREIGN col, e.g. { user_id: :id }.
+    # `eager: true` marks the join for object-graph transform: the SQL gets
+    # column aliases (users.id AS users.id, posts.id AS posts.id, ...) and
+    # the compiler returns an Extralite::Transform spec that deduplicates
+    # and nests the rows.
     class Join < Node
-      attr_reader :table_name, :type, :on
-      def initialize(table_name, type, on)
+      attr_reader :table_name, :type, :on, :eager
+      def initialize(table_name, type, on, eager: false)
         @table_name = table_name
         @type = type
         @on = on
+        @eager = eager
       end
     end
 
@@ -137,6 +167,20 @@ module Diamond
       attr_reader :value
       def initialize(value)
         @value = value
+      end
+    end
+
+    class GroupBy < Node
+      attr_reader :columns
+      def initialize(columns)
+        @columns = columns # Array of Symbol column names
+      end
+    end
+
+    class Having < Node
+      attr_reader :condition
+      def initialize(condition)
+        @condition = condition
       end
     end
 

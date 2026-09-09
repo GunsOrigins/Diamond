@@ -13,7 +13,7 @@ Gem::Specification.new do |spec|
   spec.files       = Dir["lib/**/*.rb"] + ["README.md"]
   spec.require_paths = ["lib"]
 
-  spec.add_dependency "sqlite3", "~> 1.7"
+  spec.add_dependency "extralite", "~> 3.0"
   spec.add_dependency "prism", "~> 0.17"
 
   spec.required_ruby_version = ">= 3.0.0"

@@ -41,7 +41,7 @@ describe Diamond do
   describe "::engine" do
     it "initializes the engine and caches" do
       _(Diamond.engine).must_be_kind_of Diamond::Engine
-      _(Diamond.engine.db).must_be_kind_of SQLite3::Database
+      _(Diamond.engine.db).must_be_kind_of Extralite::Database
       _(Diamond.engine.schema_cache).must_be_kind_of Hash
       _(Diamond.engine.foreign_keys).must_be_kind_of Hash
     end
@@ -360,10 +360,10 @@ describe Diamond do
         t.attribute :name, String
         t.index :name, unique: true, name: :idx_widgets_name
       end
-      rows = Diamond.engine.db.execute("PRAGMA index_list(widgets)")
-      _(rows.map { |r| r['name'] }).must_include 'idx_widgets_name'
-      row = rows.find { |r| r['name'] == 'idx_widgets_name' }
-      _(row['unique']).must_equal 1
+      rows = Diamond.engine.db.query("PRAGMA index_list(widgets)")
+      _(rows.map { |r| r[:name] }).must_include 'idx_widgets_name'
+      row = rows.find { |r| r[:name] == 'idx_widgets_name' }
+      _(row[:unique]).must_equal 1
     end
 
     it "creates a non-unique index inline via t.index" do
@@ -373,9 +373,9 @@ describe Diamond do
         t.attribute :b, Integer
         t.index :a, :b, name: :idx_w2_ab
       end
-      row = Diamond.engine.db.execute("PRAGMA index_list(widgets2)").find { |r| r['name'] == 'idx_w2_ab' }
+      row = Diamond.engine.db.query("PRAGMA index_list(widgets2)").find { |r| r[:name] == 'idx_w2_ab' }
       _(row).must_be_kind_of Hash
-      _(row['unique']).must_equal 0
+      _(row[:unique]).must_equal 0
     end
 
     it "creates an index via top-level Diamond.create_index" do
@@ -384,9 +384,9 @@ describe Diamond do
         t.attribute :a, Integer
       end
       Diamond.create_index :widgets3, [:a], unique: true, name: :idx_w3_a
-      row = Diamond.engine.db.execute("PRAGMA index_list(widgets3)").find { |r| r['name'] == 'idx_w3_a' }
+      row = Diamond.engine.db.query("PRAGMA index_list(widgets3)").find { |r| r[:name] == 'idx_w3_a' }
       _(row).must_be_kind_of Hash
-      _(row['unique']).must_equal 1
+      _(row[:unique]).must_equal 1
     end
 
     it "rejects Diamond.create_index without a name kwarg" do
@@ -398,7 +398,7 @@ describe Diamond do
 
     it "auto-enables PRAGMA foreign_keys = ON after wake_up" do
       Diamond.wake_up(':memory:')
-      row = Diamond.engine.db.execute('PRAGMA foreign_keys').first
+      row = Diamond.engine.db.query('PRAGMA foreign_keys').first
       _(row.values.first).must_equal 1
     end
   end
@@ -539,9 +539,9 @@ describe Diamond do
       recursive_q = Diamond.with_recursive(:tree, base, recursive)
       recursive_q.instance_variable_set(:@cached_result, nil)
       sql, params = Diamond::Compiler::Base.compile(recursive_q.table, recursive_q.ast)
-      expected = "WITH RECURSIVE tree AS (SELECT * FROM categories WHERE parent_id = ? UNION ALL SELECT * FROM tree) SELECT * FROM tree"
+      expected = "WITH RECURSIVE tree AS (SELECT * FROM categories WHERE parent_id IS NULL UNION ALL SELECT * FROM tree) SELECT * FROM tree"
       _(sql).must_equal expected
-      _(params).must_equal [nil]
+      _(params).must_equal []
     end
   end
 
@@ -821,10 +821,10 @@ describe Diamond do
       end
     end
 
-    it "returns a Cursor that includes Enumerable when called without a block" do
-      cursor = Users.where { age > 10 }.each
-      _(cursor).must_be_kind_of Diamond::Cursor
-      _(cursor.is_a?(Enumerable)).must_equal true
+    it "returns an Enumerator when called without a block" do
+      enum = Users.where { age > 10 }.each
+      _(enum).must_be_kind_of Enumerator
+      _(enum.is_a?(Enumerable)).must_equal true
     end
 
     it "supports first(n) on the returned Cursor" do
@@ -880,7 +880,7 @@ describe Diamond do
       end
       q = Ephemeral.where { id == 1 }
       Diamond.engine.db.execute("DROP TABLE ephemeral")
-      _(proc { q.materialize }).must_raise SQLite3::SQLException
+      _(proc { q.materialize }).must_raise Extralite::SQLError
       _(Users.count).must_equal 4
     end
 
@@ -900,8 +900,8 @@ describe Diamond do
 
     it "does not collide struct cache keys across member splits" do
       col = ->(sym) { Diamond::AST::Column.new(sym) }
-      s1 = Diamond::StructFactory.create(Users, { 'a_b' => 1, 'c' => 2 }, [col.(:a_b), col.(:c)])
-      s2 = Diamond::StructFactory.create(Users, { 'a' => 1, 'b_c' => 2 }, [col.(:a), col.(:b_c)])
+      s1 = Diamond::StructFactory.create(Users, { a_b: 1, c: 2 }, [col.(:a_b), col.(:c)])
+      s2 = Diamond::StructFactory.create(Users, { a: 1, b_c: 2 }, [col.(:a), col.(:b_c)])
       _(s1.members).must_equal [:a_b, :c]
       _(s2.members).must_equal [:a, :b_c]
       _(s1.a_b).must_equal 1
@@ -1001,7 +1001,7 @@ describe Diamond do
         t.attribute :v, String
       end
       solo_schema = Diamond.engine.schema_cache[:solo].dup
-      Diamond.engine.schema_cache.delete(:solo)
+      Diamond.engine.instance_variable_set(:@schema_cache, {})
       Diamond.engine.load_one_table!(:solo)
       _(Diamond.engine.schema_cache[:solo]).must_equal solo_schema
     end
@@ -1022,9 +1022,8 @@ describe Diamond do
       _(via_each.size).must_equal 4
     end
 
-    it "restores hash row mode after streaming" do
+    it "leaves the connection usable after streaming" do
       Users.each.to_a
-      _(Diamond.engine.db.results_as_hash).must_equal true
       _(Users.count).must_equal 4
     end
 
@@ -1249,6 +1248,236 @@ describe Diamond do
       sql, params = Diamond::Compiler::Base.compile(chained.table, chained.ast)
       _(sql).must_equal "SELECT * FROM users WHERE age > ? AND name LIKE ?"
       _(params).must_equal [10, "A%"]
+    end
+  end
+
+  # ====================================================================
+  describe "IS NULL / IS NOT NULL" do
+    it "compiles == nil to IS NULL" do
+      q = Categories.where { parent_id == nil }
+      sql, params = Diamond::Compiler::Base.compile(q.table, q.ast)
+      _(sql).must_include "IS NULL"
+      _(params).must_be_empty
+    end
+
+    it "compiles != nil to IS NOT NULL" do
+      q = Categories.where { parent_id != nil }
+      sql, params = Diamond::Compiler::Base.compile(q.table, q.ast)
+      _(sql).must_include "IS NOT NULL"
+      _(params).must_be_empty
+    end
+
+    it "materializes IS NULL correctly" do
+      Categories.create(id: 20, name: 'Leaf', parent_id: 10)
+      results = Categories.where { parent_id != nil }.materialize
+      _(results.map(&:name)).must_include 'Leaf'
+    end
+
+    it "materializes IS NOT NULL correctly" do
+      results = Categories.where { parent_id == nil }.materialize
+      _(results.map(&:name)).must_include 'Root'
+    end
+  end
+
+  # ====================================================================
+  describe "BETWEEN" do
+    it "compiles .between? to BETWEEN" do
+      q = Users.where { age.between?(10, 30) }
+      sql, params = Diamond::Compiler::Base.compile(q.table, q.ast)
+      _(sql).must_include "BETWEEN"
+      _(params).must_equal [10, 30]
+    end
+
+    it "materializes BETWEEN correctly" do
+      results = Users.where { age.between?(16, 25) }.materialize.map(&:name)
+      _(results).must_include 'Arle'
+      _(results).must_include 'Sig'
+      _(results).wont_include 'Carbuncle'
+    end
+  end
+
+  # ====================================================================
+  describe ".or" do
+    it "compiles .or to OR" do
+      q = Users.where { name == 'Arle' }
+      q = q.or { age > 10 }
+      sql, params = Diamond::Compiler::Base.compile(q.table, q.ast)
+      _(sql).must_include "OR"
+      _(params).must_equal ['Arle', 10]
+    end
+
+    it "materializes .or correctly" do
+      q = Users.where { name == 'Arle' }
+      q = q.or { name == 'High' }
+      results = q.materialize.map(&:name)
+      _(results).must_include 'Arle'
+      _(results).must_include 'High'
+      _(results).wont_include 'Sig'
+    end
+  end
+
+  # ====================================================================
+  describe "Subqueries" do
+    before do
+      Diamond.engine.db.execute("INSERT INTO posts (id, user_id, title) VALUES (10, 1, 'first')")
+      Diamond.engine.db.execute("INSERT INTO posts (id, user_id, title) VALUES (11, 2, 'bobs post')")
+    end
+
+    it "compiles a subquery in IN clause" do
+      sub = Posts.select(:user_id)
+      q = Users.where_sub(:id, sub)
+      sql, params = Diamond::Compiler::Base.compile(q.table, q.ast)
+      _(sql).must_include "IN (SELECT user_id FROM posts)"
+      _(params).must_be_empty
+    end
+
+    it "materializes a subquery correctly" do
+      sub = Posts.select(:user_id)
+      results = Users.where_sub(:id, sub).materialize.map(&:name)
+      _(results).must_include 'Arle'
+      _(results).must_include 'Carbuncle'
+      _(results).wont_include 'Sig'
+    end
+  end
+
+  # ====================================================================
+  describe "Multi-column joins" do
+    before do
+      Diamond.define_relation(:order_items) do |t|
+        t.attribute :id, Integer, primary_key: true, nullable: false
+        t.attribute :user_id, Integer
+        t.attribute :post_id, Integer
+        t.attribute :quantity, Integer
+      end
+    end
+
+    it "compiles a multi-column ON clause" do
+      q = Users.join(:order_items, on: { user_id: :id })
+      sql, _ = Diamond::Compiler::Base.compile(q.table, q.ast)
+      _(sql).must_include "ON order_items.user_id = users.id"
+    end
+  end
+
+  # ====================================================================
+  describe "GROUP BY / HAVING" do
+    it "compiles GROUP BY" do
+      q = Users.derive { count(id) }.group(:age)
+      sql, _ = Diamond::Compiler::Base.compile(q.table, q.ast)
+      _(sql).must_include "GROUP BY age"
+    end
+
+    it "compiles HAVING" do
+      q = Users.derive { count(id) }.group(:age)
+      q = q.having { count(id) > 1 }
+      sql, params = Diamond::Compiler::Base.compile(q.table, q.ast)
+      _(sql).must_include "HAVING"
+      _(params).must_equal [1]
+    end
+
+    it "materializes GROUP BY correctly" do
+      q = Users.derive { count(id) }.group(:age)
+      results = q.materialize
+      _(results.size).must_equal 4
+    end
+  end
+
+  # ====================================================================
+  describe "Transactions" do
+    it "commits on success" do
+      initial = Users.count
+      Diamond.transaction do
+        Users.create(id: 100, name: 'TxUser', age: 1)
+      end
+      _(Users.count).must_equal initial + 1
+      _(Users.find(100).name).must_equal 'TxUser'
+    end
+
+    it "rolls back on exception" do
+      initial = Users.count
+      begin
+        Diamond.transaction do
+          Users.create(id: 101, name: 'Rolled', age: 1)
+          raise "boom"
+        end
+      rescue RuntimeError
+        # expected
+      end
+      _(Users.count).must_equal initial
+      _(proc { Users.find(101).name }).must_raise Diamond::RecordNotFound
+    end
+
+    it "returns the block's value on commit" do
+      result = Diamond.transaction { 42 }
+      _(result).must_equal 42
+    end
+  end
+
+  # ====================================================================
+  describe "Eager loading via Extralite::Transform" do
+    before do
+      Diamond.define_relation(:comments) do |t|
+        t.attribute :id, Integer, primary_key: true, nullable: false
+        t.attribute :user_id, Integer
+        t.attribute :body, String
+        t.foreign_key :user_id, :users
+      end
+      Diamond.engine.db.execute("INSERT INTO posts (id, user_id, title) VALUES (10, 1, 'first')")
+      Diamond.engine.db.execute("INSERT INTO posts (id, user_id, title) VALUES (11, 1, 'second')")
+      Diamond.engine.db.execute("INSERT INTO posts (id, user_id, title) VALUES (12, 2, 'bobs post')")
+      Diamond.engine.db.execute("INSERT INTO comments (id, user_id, body) VALUES (100, 1, 'hi')")
+      Diamond.engine.db.execute("INSERT INTO comments (id, user_id, body) VALUES (101, 2, 'hello')")
+    end
+
+    it ".includes(:posts) produces a nested struct array on the parent" do
+      results = Users.includes(:posts).materialize
+      alice = results.find { |u| u.id == 1 }
+      bob   = results.find { |u| u.id == 2 }
+      _(alice.posts.map(&:title).sort).must_equal ["first", "second"]
+      _(bob.posts.map(&:title)).must_equal ["bobs post"]
+    end
+
+    it ".join(:posts, eager: true) is the lower-level spelling of .includes" do
+      eager   = Users.includes(:posts).materialize
+      flagged = Users.join(:posts, eager: true).materialize
+      _(flagged.map(&:id).sort).must_equal eager.map(&:id).sort
+    end
+
+    it "supports multiple eager-load relations" do
+      results = Users.includes(:posts, :comments).materialize
+      alice = results.find { |u| u.id == 1 }
+      _(alice.posts.size).must_equal 2
+      _(alice.comments.map(&:body)).must_equal ["hi"]
+    end
+
+    it "deduplicates children via Extralite::Transform .identity" do
+      results = Users.includes(:posts).materialize
+      _(results.size).must_equal 4, "four users, not duplicated"
+    end
+
+    it "yields nested structs through .each" do
+      collected = []
+      Users.includes(:posts).each { |u| collected << u }
+      _(collected.first.posts.size).must_equal 2
+    end
+
+    it "supports .includes with a where clause" do
+      results = Users.where { id == 1 }.includes(:posts).materialize
+      _(results.size).must_equal 1
+      _(results.first.posts.size).must_equal 2
+    end
+
+    it "children are frozen Structs" do
+      alice = Users.includes(:posts).materialize.find { |u| u.id == 1 }
+      alice.posts.each do |p|
+        _(p).must_be_kind_of Struct
+        _(p.frozen?).must_equal true
+      end
+    end
+
+    it "parent rows are frozen Structs" do
+      alice = Users.includes(:posts).materialize.find { |u| u.id == 1 }
+      _(alice).must_be_kind_of Struct
+      _(alice.frozen?).must_equal true
     end
   end
 end

@@ -7,6 +7,26 @@ module Diamond
         _append_to_query([AST::Where.new(condition)])
       end
 
+      def _build_or_where(&block)
+        condition = Parser.parse_block(block, _schema_for_dsl)
+        raise "Or block must return an AST condition" unless condition.is_a?(AST::Node)
+
+        if self.is_a?(Diamond::Table)
+          return Diamond::QueryObject.new(self, [AST::Where.new(condition)])
+        end
+
+        last_where = @ast.rindex { |n| n.is_a?(AST::Where) }
+        if last_where
+          existing = @ast[last_where].condition
+          combined = AST::Or.new(existing, condition)
+          new_ast = @ast.dup
+          new_ast[last_where] = AST::Where.new(combined)
+          Diamond::QueryObject.new(@table, new_ast)
+        else
+          Diamond::QueryObject.new(@table, @ast + [AST::Where.new(condition)])
+        end
+      end
+
       def _build_where_node(condition_node)
         raise "Where node must be an AST::Node" unless condition_node.is_a?(AST::Node)
         _append_to_query([AST::Where.new(condition_node)])
@@ -32,11 +52,22 @@ module Diamond
         _append_to_query([AST::Projection.new(nodes)])
       end
 
-      def _build_join(table_name, type, on)
+      def _build_join(table_name, type, on, eager: false)
         if on.nil?
           on = _resolve_join_keys(table_name)
         end
-        _append_to_query([AST::Join.new(table_name, type, on)])
+        _append_to_query([AST::Join.new(table_name, type, on, eager: eager)])
+      end
+
+      # `.includes(:posts)` is sugar for `.join(:posts, eager: true)`.
+      # supports a single table or a list. each eagerly-loaded child becomes
+      # a nested struct array on the parent.
+      def _build_includes(*tables)
+        result = self
+        tables.each do |table_name|
+          result = result._build_join(table_name, :left, nil, eager: true)
+        end
+        result
       end
 
       def _build_order(*args, **kwargs)
@@ -84,6 +115,21 @@ module Diamond
       def _build_offset(n)
         raise ArgumentError, "offset must be Integer >= 0, got #{n.inspect}" unless n.is_a?(Integer) && n >= 0
         _filter_or_append(AST::Offset, AST::Offset.new(n))
+      end
+
+      def _build_group(columns)
+        validated = columns.map do |c|
+          sym = c.to_sym
+          raise Diamond::UnknownColumnError.build(_schema_for_dsl, sym) unless _schema_for_dsl[:columns].include?(sym)
+          sym
+        end
+        _filter_or_append(AST::GroupBy, AST::GroupBy.new(validated))
+      end
+
+      def _build_having(&block)
+        condition = Parser.parse_block(block, _schema_for_dsl)
+        raise "Having block must return an AST condition" unless condition.is_a?(AST::Node)
+        _filter_or_append(AST::Having, AST::Having.new(condition))
       end
 
       # --- Context Hooks (Used by the DSL modules) ---

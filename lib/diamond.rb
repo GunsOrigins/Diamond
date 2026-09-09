@@ -1,4 +1,10 @@
-require 'sqlite3'
+# shareable_constant_value: literal
+#
+# makes every top-level constant declared below shareable across Ractors.
+# `Users` etc. become references to shareable objects, so a Ractor can
+# resolve `Users` without going through any global mutable state.
+
+require 'extralite'
 require 'prism'
 require 'did_you_mean'
 
@@ -59,13 +65,13 @@ module Diamond
     name
   end
 
-  # ::Names we've bound, so a later wake_up can unbind them instead of
-  # leaving them pinned to the dead engine's schema.
+  # Names we've bound as frozen constants, so a later wake_up can unbind them
+  # instead of leaving them pinned to the dead engine's schema.
   @bound_tables = []
 
   def self.wake_up(db_path)
     @engine = Engine.new(db_path)
-    @engine.db.execute('PRAGMA foreign_keys = ON')
+    @engine.freeze!
 
     # including twice is a no-op for ancestors but still busts ruby's global
     # method cache. guard it so per-test wake_up stays cheap.
@@ -86,6 +92,7 @@ module Diamond
     end
 
     rebind_tables!
+    bind_tables!
   end
 
   # drop old constants so the next reference re-resolves (or raises
@@ -97,12 +104,47 @@ module Diamond
     @bound_tables.clear
   end
 
+  # eager-bind every schema table as a frozen top-level constant. Ractor-safe
+  # because the Table object is immutable after .freeze, and the engine's
+  # schema cache is frozen (see Engine#freeze!).
+  def self.bind_tables!
+    return unless @engine
+    @engine.schema_cache.each_key do |table_sym|
+      const_name = table_sym.to_s.split('_').map(&:capitalize).join
+      next if Object.const_defined?(const_name, false)
+      proxy = Table.new(table_sym).freeze
+      Object.const_set(const_name, proxy)
+      @bound_tables << const_name unless @bound_tables.include?(const_name)
+    end
+  end
+
   def self.note_bound_table(const_name)
     @bound_tables << const_name unless @bound_tables.include?(const_name)
   end
 
   def self.engine
     @engine
+  end
+
+  # Wrap a block in BEGIN/COMMIT. Rolls back on exception.
+  #
+  #   Diamond.transaction do
+  #     Users.create(name: 'A')
+  #     Posts.create(title: 'B', user_id: 1)
+  #   end
+  #
+  # Returns the block's return value on commit, re-raises on rollback.
+  def self.transaction(&block)
+    raise ArgumentError, "transaction requires a block" unless block
+    @engine.db.execute('BEGIN')
+    begin
+      result = block.call
+      @engine.db.execute('COMMIT')
+      result
+    rescue StandardError
+      @engine.db.execute('ROLLBACK')
+      raise
+    end
   end
 
   # drop everything derived from the old schema. runs on reload_schema!.
@@ -113,14 +155,18 @@ module Diamond
   end
 end
 
-# reopening Module with `def` screams warnings so we prepend
+# const_missing is kept as a fallback only. wake_up's bind_tables! already
+# defines every schema table; this hook only fires for typo'd constants
+# (where Diamond can't help) or in older code paths. Either way it raises
+# NameError cleanly instead of silently inventing proxies.
 module DiamondConstMissing
   def const_missing(name)
     table_sym = name.to_s.downcase.to_sym
 
     if Diamond.engine && Diamond.engine.schema_cache.key?(table_sym)
-      proxy = Diamond::Table.new(table_sym)
-      # tables are global by design
+      # schema had this table but it wasn't eager-bound (e.g., bind_tables!
+      # ran before this table existed). bind it now.
+      proxy = Diamond::Table.new(table_sym).freeze
       Object.const_set(name, proxy)
       Diamond.note_bound_table(name)
       proxy

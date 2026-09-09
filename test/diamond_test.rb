@@ -42,7 +42,7 @@ class DiamondTest < Minitest::Test
 
   def test_engine_initialized
     assert_kind_of Diamond::Engine, Diamond.engine
-    assert_kind_of SQLite3::Database, Diamond.engine.db
+    assert_kind_of Extralite::Database, Diamond.engine.db
     assert_kind_of Hash, Diamond.engine.schema_cache
     assert_kind_of Hash, Diamond.engine.foreign_keys
   end
@@ -187,11 +187,11 @@ class DiamondTest < Minitest::Test
       t.attribute :name, String
       t.index :name, unique: true, name: :idx_widgets_name
     end
-    indexes = Diamond.engine.db.execute("PRAGMA index_list(widgets)")
-    names = indexes.map { |row| row['name'] }
+    indexes = Diamond.engine.db.query("PRAGMA index_list(widgets)")
+    names = indexes.map { |row| row[:name] }
     assert_includes names, 'idx_widgets_name'
-    unique_row = indexes.find { |row| row['name'] == 'idx_widgets_name' }
-    assert_equal 1, unique_row['unique']
+    unique_row = indexes.find { |row| row[:name] == 'idx_widgets_name' }
+    assert_equal 1, unique_row[:unique]
   end
 
   def test_inline_index_non_unique_emits_plain_index
@@ -201,10 +201,10 @@ class DiamondTest < Minitest::Test
       t.attribute :b, Integer
       t.index :a, :b, name: :idx_w2_ab
     end
-    indexes = Diamond.engine.db.execute("PRAGMA index_list(widgets2)")
-    row = indexes.find { |r| r['name'] == 'idx_w2_ab' }
+    indexes = Diamond.engine.db.query("PRAGMA index_list(widgets2)")
+    row = indexes.find { |r| r[:name] == 'idx_w2_ab' }
     assert row, "expected idx_w2_ab in #{indexes.inspect}"
-    assert_equal 0, row['unique']
+    assert_equal 0, row[:unique]
   end
 
   def test_top_level_create_index_via_diamond_method
@@ -213,9 +213,9 @@ class DiamondTest < Minitest::Test
       t.attribute :a, Integer
     end
     Diamond.create_index :widgets3, [:a], unique: true, name: :idx_w3_a
-    row = Diamond.engine.db.execute("PRAGMA index_list(widgets3)").find { |r| r['name'] == 'idx_w3_a' }
+    row = Diamond.engine.db.query("PRAGMA index_list(widgets3)").find { |r| r[:name] == 'idx_w3_a' }
     assert row
-    assert_equal 1, row['unique']
+    assert_equal 1, row[:unique]
   end
 
   def test_create_index_requires_name_kwarg
@@ -227,7 +227,7 @@ class DiamondTest < Minitest::Test
 
   def test_wake_up_enables_foreign_keys_pragma
     Diamond.wake_up(':memory:')
-    row = Diamond.engine.db.execute('PRAGMA foreign_keys').first
+    row = Diamond.engine.db.query('PRAGMA foreign_keys').first
     assert_equal 1, row.values.first,
                  "PRAGMA should be ON after wake_up so FK actions enforce"
   end
@@ -534,9 +534,9 @@ class DiamondTest < Minitest::Test
     recursive_q = Diamond.with_recursive(:tree, base, recursive)
     recursive_q.instance_variable_set(:@cached_result, nil)
     sql, params = Diamond::Compiler::Base.compile(recursive_q.table, recursive_q.ast)
-    expected = "WITH RECURSIVE tree AS (SELECT * FROM categories WHERE parent_id = ? UNION ALL SELECT * FROM tree) SELECT * FROM tree"
+    expected = "WITH RECURSIVE tree AS (SELECT * FROM categories WHERE parent_id IS NULL UNION ALL SELECT * FROM tree) SELECT * FROM tree"
     assert_equal expected, sql
-    assert_equal [nil], params
+    assert_equal [], params
   end
 
   # ====================================================================
@@ -828,10 +828,10 @@ class DiamondTest < Minitest::Test
     end
   end
 
-  def test_each_without_block_returns_cursor_that_includes_enumerable
-    cursor = Users.where { age > 10 }.each
-    assert_kind_of Diamond::Cursor, cursor
-    assert cursor.is_a?(Enumerable)
+  def test_each_without_block_returns_enumerator
+    enum = Users.where { age > 10 }.each
+    assert_kind_of Enumerator, enum
+    assert enum.is_a?(Enumerable)
   end
 
   def test_each_cursor_supports_first_n
@@ -890,7 +890,7 @@ class DiamondTest < Minitest::Test
     end
     q = Ephemeral.where { id == 1 }
     Diamond.engine.db.execute("DROP TABLE ephemeral")
-    assert_raises(SQLite3::SQLException) { q.materialize }
+    assert_raises(Extralite::SQLError) { q.materialize }
     assert_equal 4, Users.count, "connection still usable after failed materialize"
   end
 
@@ -912,8 +912,8 @@ class DiamondTest < Minitest::Test
 
   def test_struct_cache_key_no_collision_across_member_splits
     col = ->(sym) { Diamond::AST::Column.new(sym) }
-    s1 = Diamond::StructFactory.create(Users, { 'a_b' => 1, 'c' => 2 }, [col.(:a_b), col.(:c)])
-    s2 = Diamond::StructFactory.create(Users, { 'a' => 1, 'b_c' => 2 }, [col.(:a), col.(:b_c)])
+    s1 = Diamond::StructFactory.create(Users, { a_b: 1, c: 2 }, [col.(:a_b), col.(:c)])
+    s2 = Diamond::StructFactory.create(Users, { a: 1, b_c: 2 }, [col.(:a), col.(:b_c)])
     assert_equal [:a_b, :c], s1.members
     assert_equal [:a, :b_c], s2.members
     assert_equal 1, s1.a_b
@@ -1018,7 +1018,9 @@ class DiamondTest < Minitest::Test
       t.attribute :v, String
     end
     solo_schema = Diamond.engine.schema_cache[:solo].dup
-    Diamond.engine.schema_cache.delete(:solo)
+    # simulate cache wipe by reassigning to a fresh hash (the cache is frozen
+    # at boot; load_one_table! works by merging into a new hash)
+    Diamond.engine.instance_variable_set(:@schema_cache, {})
     Diamond.engine.load_one_table!(:solo)
     assert_equal solo_schema, Diamond.engine.schema_cache[:solo]
   end
@@ -1040,9 +1042,9 @@ class DiamondTest < Minitest::Test
     assert_equal 4, via_each.size
   end
 
-  def test_each_restores_hash_row_mode_afterwards
+  def test_each_leaves_connection_usable
     Users.each.to_a
-    assert_equal true, Diamond.engine.db.results_as_hash
+    # Independent query proves each didn't leave the connection in a bad state.
     assert_equal 4, Users.count
   end
 

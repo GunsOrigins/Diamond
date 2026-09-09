@@ -186,9 +186,22 @@ module Diamond
 
           if node.name == :proc && node.block
             translate_where(node.block, schema)
+          elsif node.name == :between? && node.receiver
+            # column.between?(low, high)
+            col = translate_where(node.receiver, schema)
+            args = node.arguments.arguments
+            raise BlockMismatch, "between? requires exactly 2 arguments" unless args.size == 2
+            low = translate_where(args[0], schema)
+            high = translate_where(args[1], schema)
+            AST::Between.new(col, low, high)
           elsif node.receiver.nil? && node.arguments.nil?
             validate_column!(node.name, schema)
             AST::Column.new(node.name)
+          elsif node.receiver.nil? && node.arguments
+            # bare function call: `count(id)`, `sum(age)`, etc.
+            # useful for HAVING clauses.
+            args = node.arguments.arguments.map { |a| translate_where(a, schema) }
+            AST::Function.new(node.name, args)
           elsif node.receiver && node.arguments
 
           left      = translate_where(node.receiver, schema)
@@ -205,6 +218,15 @@ module Diamond
           end
 
           right = translate_where(right_arg, schema)
+
+          # handle nil comparisons specially: == nil -> IS NULL, != nil -> IS NOT NULL
+          if right.is_a?(AST::Literal) && right.value.nil?
+            return case node.name
+                   when :==   then AST::IsNull.new(left)
+                   when :"!=" then AST::IsNotNull.new(left)
+                   end
+          end
+
           case node.name
           when :> then AST::GreaterThan.new(left, right)
           when :< then AST::LessThan.new(left, right)

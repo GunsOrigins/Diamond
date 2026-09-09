@@ -9,10 +9,13 @@ module Diamond
         sql = "INSERT INTO #{table.name} (#{cols.join(', ')}) VALUES (#{placeholders})"
         params = insert_node.data.values
 
-        stmt = Diamond.engine.db.prepare(sql)
+        db = Diamond.engine.db
+        stmt = db.prepare(sql)
         begin
-          stmt.bind_params(params)
-          stmt.execute
+          stmt.bind(*params)
+          # Extralite prepared statements don't run DML on #execute; #to_a
+          # forces the statement and consumes the (empty) result set.
+          stmt.to_a
         ensure
           begin
             stmt.close unless stmt.closed?
@@ -20,7 +23,7 @@ module Diamond
             # ensure must not raise
           end
         end
-        Diamond.engine.db.last_insert_row_id
+        db.last_insert_rowid
       end
 
       def self.compile_update(table, hash, where_nodes)
@@ -34,10 +37,11 @@ module Diamond
           sql += " WHERE " + conditions.join(' AND ')
         end
 
-        stmt = Diamond.engine.db.prepare(sql)
+        db = Diamond.engine.db
+        stmt = db.prepare(sql)
         begin
-          stmt.bind_params(params)
-          stmt.execute
+          stmt.bind(*params)
+          stmt.to_a
         ensure
           begin
             stmt.close unless stmt.closed?
@@ -45,7 +49,7 @@ module Diamond
             # ensure must not raise
           end
         end
-        Diamond.engine.db.changes
+        db.changes
       end
 
       def self.compile_delete(table, where_nodes)
@@ -56,10 +60,11 @@ module Diamond
           sql += " WHERE " + conditions.join(' AND ')
         end
 
-        stmt = Diamond.engine.db.prepare(sql)
+        db = Diamond.engine.db
+        stmt = db.prepare(sql)
         begin
-          stmt.bind_params(params)
-          stmt.execute
+          stmt.bind(*params)
+          stmt.to_a
         ensure
           begin
             stmt.close unless stmt.closed?
@@ -67,7 +72,7 @@ module Diamond
             # ensure must not raise
           end
         end
-        Diamond.engine.db.changes
+        db.changes
       end
     end
   end
