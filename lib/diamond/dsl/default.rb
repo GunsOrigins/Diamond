@@ -30,9 +30,6 @@ module Diamond
         _build_where_node(condition)
       end
 
-      # alias kept for back-compat
-      alias_method :where_sub, :where_in
-
       # Build a projection. Accepts column symbols, AST nodes, or a block
       # that yields bare columns, function calls, and window chains. Also
       # used to shape a subquery for `where_in`:

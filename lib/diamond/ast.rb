@@ -11,9 +11,12 @@ module Diamond
       end
     end
 
+    # `table` is nil for plain `age`, or a table name for qualified
+    # `tags.tag` refs in blocks over joins. qualified columns render with
+    # their own table and ignore the eager parent-prefix.
     class Column < Node
-      attr_reader :name
-      def initialize(name); @name = name; end
+      attr_reader :name, :table
+      def initialize(name, table: nil); @name = name; @table = table; end
 
       def ==(other)
         AST::Equality.new(self, AST::Literal.new(other))

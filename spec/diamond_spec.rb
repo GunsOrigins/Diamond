@@ -427,6 +427,62 @@ describe Diamond do
   end
 
   # ====================================================================
+  describe "qualified where refs" do
+    before do
+      Diamond.define_relation(:tags) do |t|
+        t.attribute :id, Integer, primary_key: true, nullable: false
+        t.attribute :post_id, Integer
+        t.attribute :tag, String
+        t.foreign_key :post_id, :posts
+      end
+      Diamond.engine.db.execute("INSERT INTO posts (id, user_id, title) VALUES (10, 1, 'first')")
+      Diamond.engine.db.execute("INSERT INTO posts (id, user_id, title) VALUES (11, 2, 'second')")
+      Diamond.engine.db.execute("INSERT INTO tags (id, post_id, tag) VALUES (100, 10, 'greet')")
+      Diamond.engine.db.execute("INSERT INTO tags (id, post_id, tag) VALUES (101, 11, 'farewell')")
+    end
+
+    it "compiles tags.tag to a qualified column" do
+      q = Posts.join(:tags)
+      q = q.where { tags.tag == 'greet' }
+      sql, params = Diamond::Compiler::Base.compile(q.table, q.ast)
+      _(sql).must_include "WHERE tags.tag = ?"
+      _(params).must_equal ['greet']
+    end
+
+    it "materializes through the join" do
+      q = Posts.join(:tags)
+      q = q.where { tags.tag == 'farewell' }
+      _(q.materialize.map(&:title)).must_equal ['second']
+    end
+
+    it "bare columns still mean the base table on ties" do
+      # stays unqualified at compile time (old queries keep working);
+      # sqlite itself calls it ambiguous at runtime — qualify to fix.
+      q = Posts.join(:tags)
+      q = q.where { id == 10 }
+      sql, params = Diamond::Compiler::Base.compile(q.table, q.ast)
+      _(sql).must_include "WHERE id = ?"
+      _(params).must_equal [10]
+    end
+
+    it "raises join-first when the where runs before the join" do
+      err = assert_raises(ArgumentError) { Posts.where { tags.tag == 'x' } }
+      _(err.message).must_match(/\.join\(:tags\)/)
+    end
+
+    it "combines with eager loading" do
+      q = Posts.includes(:tags)
+      q = q.where { tags.tag == 'greet' }
+      _(q.materialize.map(&:title)).must_equal ['first']
+    end
+
+    it "unknown columns on joined tables still error" do
+      q = Posts.join(:tags)
+      _(proc { q.where { tags.nope == 1 } }).must_raise Diamond::UnknownColumnError
+    end
+  end
+
+  # ====================================================================
   describe "::derive" do
     it "translates count(id) to SELECT COUNT(id)" do
       q = Users.derive { count(id) }
@@ -1309,6 +1365,14 @@ describe Diamond do
     it "materializes .or correctly" do
       q = Users.where { name == 'Arle' }
       q = q.or { name == 'High' }
+      results = q.materialize.map(&:name)
+      _(results).must_include 'Arle'
+      _(results).must_include 'High'
+      _(results).wont_include 'Sig'
+    end
+
+    it "resolves two same-line blocks in call order" do
+      q = Users.where { name == 'Arle' }; q = q.or { name == 'High' }
       results = q.materialize.map(&:name)
       _(results).must_include 'Arle'
       _(results).must_include 'High'

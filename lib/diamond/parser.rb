@@ -37,10 +37,12 @@ module Diamond
     end
 
     # ====================================================================
-    # where blocks: one expression in, one AST::Node out.
+    # where blocks: one expression in, one AST::Node out. `scope` maps
+    # table names in play (base + joins) to their schemas; when present,
+    # `tags.tag` in a block resolves to a qualified column.
     # ====================================================================
-    def self.parse_block(block, schema)
-      _parse_with_candidates(block, :where) { |node| translate_where(node, schema) }
+    def self.parse_block(block, schema, scope = nil)
+      _parse_with_candidates(block, :where) { |node| translate_where(node, schema, scope) }
     end
 
     # ====================================================================
@@ -134,23 +136,39 @@ module Diamond
       end
     end
 
-    # chained blocks on one line (`.where{}.update{}`) all live on the same
-    # line, so try each in order and take the first that parses. real errors
-    # (UnknownColumn etc.) still blow up - only shape mismatches move on.
+    # chained blocks on one line (`.where{}.or{}`) all live on the same
+    # line, so consume candidates in call order: each call scans forward
+    # from a per-key cursor (wrapping) and takes the first candidate that
+    # parses. the wrap matters — a chained line inside a loop must resolve
+    # 0,1,0,1... across iterations, not drift. single-block lines always
+    # resolve index 0, so existing behavior is unchanged.
+    # real errors (UnknownColumn etc.) still blow up - only shape
+    # mismatches move on to the next candidate.
     def self._parse_with_candidates(block, purpose, &translator)
       file, line = block.source_location
       raise "Cannot parse block without a file source" unless file
 
       cache = cache_for(purpose)
-      cache_key = [file, line, purpose]
-      return cache[cache_key] if cache.key?(cache_key)
-
       candidates = candidate_blocks(file, line)
+      raise "No parseable #{purpose} block found at #{file}:#{line}" if candidates.empty?
+
+      cursor_key = [file, line, purpose, :cursor]
+      cursor = cache[cursor_key] || 0
 
       result = nil
-      candidates.each do |candidate|
+      result_index = nil
+      candidates.size.times do |step|
+        idx = (cursor + step) % candidates.size
+        cache_key = [file, line, purpose, idx]
+        if cache.key?(cache_key)
+          result = cache[cache_key]
+          result_index = idx
+          break
+        end
         begin
-          result = translator.call(candidate)
+          result = translator.call(candidates[idx])
+          result_index = idx
+          cache[cache_key] = result
           break
         rescue BlockMismatch
           next
@@ -158,7 +176,8 @@ module Diamond
       end
 
       raise "No parseable #{purpose} block found at #{file}:#{line}" if result.nil?
-      cache[cache_key] = result
+      cache[cursor_key] = (result_index + 1) % candidates.size
+      result
     end
 
     def self.unwrap_statements(block_node)
@@ -169,34 +188,34 @@ module Diamond
     end
 
     # ----- Where translation -----
-    def self.translate_where(node, schema)
+    def self.translate_where(node, schema, scope = nil)
       hook = WhereOperators.call(node, schema)
       return hook if hook
       case node
       when Prism::BlockNode
-        translate_where(node.body, schema)
+        translate_where(node.body, schema, scope)
       when Prism::StatementsNode
-        translate_where(node.body.first, schema)
+        translate_where(node.body.first, schema, scope)
       when Prism::ParenthesesNode
-        translate_where(node.body, schema)
+        translate_where(node.body, schema, scope)
       when Prism::CallNode
           # `.in()` takes any number of args (including zero), so catch it
           # before the binary-op path that assumes exactly one.
           if node.name == :in && node.receiver
-            lhs  = translate_where(node.receiver, schema)
-            vals = node.arguments ? node.arguments.arguments.map { |a| translate_where(a, schema) } : []
+            lhs  = translate_where(node.receiver, schema, scope)
+            vals = node.arguments ? node.arguments.arguments.map { |a| translate_where(a, schema, scope) } : []
             return AST::In.new(lhs, vals)
           end
 
           if node.name == :proc && node.block
-            translate_where(node.block, schema)
+            translate_where(node.block, schema, scope)
           elsif node.name == :between? && node.receiver
             # column.between?(low, high)
-            col = translate_where(node.receiver, schema)
+            col = translate_where(node.receiver, schema, scope)
             args = node.arguments.arguments
             raise BlockMismatch, "between? requires exactly 2 arguments" unless args.size == 2
-            low = translate_where(args[0], schema)
-            high = translate_where(args[1], schema)
+            low = translate_where(args[0], schema, scope)
+            high = translate_where(args[1], schema, scope)
             AST::Between.new(col, low, high)
           elsif node.receiver.nil? && node.arguments.nil?
             validate_column!(node.name, schema)
@@ -204,24 +223,31 @@ module Diamond
           elsif node.receiver.nil? && node.arguments
             # bare function call: `count(id)`, `sum(age)`, etc.
             # useful for HAVING clauses.
-            args = node.arguments.arguments.map { |a| translate_where(a, schema) }
+            args = node.arguments.arguments.map { |a| translate_where(a, schema, scope) }
             AST::Function.new(node.name, args)
+          elsif node.receiver && node.arguments.nil?
+            # standalone qualified ref: `tags.tag` (as a between?/in
+            # receiver, say). anything else here is still a mismatch.
+            qualified = try_qualified(node.receiver, node.name, schema, scope)
+            return qualified if qualified
+            join_first_hint(node.receiver, node.name, schema, scope)
+            raise BlockMismatch, "Unsupported call: #{node.inspect}"
           elsif node.receiver && node.arguments
 
-          left      = translate_where(node.receiver, schema)
+          left      = translate_receiver(node, schema, scope)
           right_arg = node.arguments.arguments.first
 
           if node.name == :== && right_arg.is_a?(Prism::ArrayNode)
-            vals = right_arg.elements.map { |e| translate_where(e, schema) }
+            vals = right_arg.elements.map { |e| translate_where(e, schema, scope) }
             return AST::In.new(left, vals)
           end
 
           if node.name == :"!=" && right_arg.is_a?(Prism::ArrayNode)
-            vals = right_arg.elements.map { |e| translate_where(e, schema) }
+            vals = right_arg.elements.map { |e| translate_where(e, schema, scope) }
             return AST::NotIn.new(left, vals)
           end
 
-          right = translate_where(right_arg, schema)
+          right = translate_where(right_arg, schema, scope)
 
           # handle nil comparisons specially: == nil -> IS NULL, != nil -> IS NOT NULL
           if right.is_a?(AST::Literal) && right.value.nil?
@@ -245,9 +271,9 @@ module Diamond
             raise BlockMismatch, "Unsupported call: #{node.inspect}"
           end
       when Prism::AndNode
-        AST::And.new(translate_where(node.left, schema), translate_where(node.right, schema))
+        AST::And.new(translate_where(node.left, schema, scope), translate_where(node.right, schema, scope))
       when Prism::OrNode
-        AST::Or.new(translate_where(node.left, schema), translate_where(node.right, schema))
+        AST::Or.new(translate_where(node.left, schema, scope), translate_where(node.right, schema, scope))
       when Prism::IntegerNode
         AST::Literal.new(node.value)
       when Prism::FloatNode
@@ -263,6 +289,42 @@ module Diamond
       else
         raise BlockMismatch, "Unsupported Prism AST Node: #{node.class}"
       end
+    end
+
+    # left side of a binary op. usually a plain column; `tags.tag` (a
+    # bareword call on a bareword table in scope) resolves qualified.
+    def self.translate_receiver(node, schema, scope)
+      recv = node.receiver
+      qualified = try_qualified(recv, node.name, schema, scope)
+      return qualified if qualified
+      join_first_hint(recv, node.name, schema, scope)
+      translate_where(recv, schema, scope)
+    end
+
+    # `recv` must be a bareword (`tags`), `col` the method on it (`tag`).
+    # plain base columns win ties so old queries keep working. returns nil
+    # when this isn't a qualified ref at all (caller falls through).
+    def self.try_qualified(recv, col, schema, scope)
+      return nil unless recv.is_a?(Prism::CallNode) && recv.receiver.nil? && recv.arguments.nil?
+      return nil if schema[:columns].include?(recv.name)
+      return nil unless scope && scope.key?(recv.name)
+
+      validate_column!(col, scope[recv.name])
+      AST::Column.new(col, table: recv.name)
+    end
+
+    # same shape, but the table isn't joined (yet). happens when the where
+    # runs before the join in the chain — tell them the order matters
+    # instead of a confusing column error. nil when not applicable.
+    def self.join_first_hint(recv, col, schema, scope)
+      return nil unless recv.is_a?(Prism::CallNode) && recv.receiver.nil? && recv.arguments.nil?
+      return nil if schema[:columns].include?(recv.name)
+      return nil if scope && scope.key?(recv.name)
+      return nil unless Diamond.engine.schema_cache.key?(recv.name)
+
+      raise ArgumentError,
+            "filtering on '#{recv.name}.#{col}' needs `.join(:#{recv.name})` first " \
+            "(joins must come before the where that filters on them)"
     end
 
     # ----- Derive translation -----

@@ -2,13 +2,13 @@ module Diamond
   module Domains
     module DQL
       def _build_where(&block)
-        condition = Parser.parse_block(block, _schema_for_dsl)
+        condition = Parser.parse_block(block, _schema_for_dsl, _scope_for_dsl)
         raise "Where block must return an AST condition" unless condition.is_a?(AST::Node)
         _append_to_query([AST::Where.new(condition)])
       end
 
       def _build_or_where(&block)
-        condition = Parser.parse_block(block, _schema_for_dsl)
+        condition = Parser.parse_block(block, _schema_for_dsl, _scope_for_dsl)
         raise "Or block must return an AST condition" unless condition.is_a?(AST::Node)
 
         if self.is_a?(Diamond::Table)
@@ -127,7 +127,7 @@ module Diamond
       end
 
       def _build_having(&block)
-        condition = Parser.parse_block(block, _schema_for_dsl)
+        condition = Parser.parse_block(block, _schema_for_dsl, _scope_for_dsl)
         raise "Having block must return an AST condition" unless condition.is_a?(AST::Node)
         _filter_or_append(AST::Having, AST::Having.new(condition))
       end
@@ -135,6 +135,21 @@ module Diamond
       # --- Context Hooks (Used by the DSL modules) ---
       def _schema_for_dsl
         self.is_a?(Diamond::Table) ? @schema : @table.schema
+      end
+
+      # tables the current chain can filter on: the base table plus every
+      # joined table, each mapped to its schema. lets `tags.tag` in a
+      # block resolve to a qualified column. unknown join targets are
+      # skipped (their own errors surface at compile time).
+      def _scope_for_dsl
+        base = self.is_a?(Diamond::Table) ? @name : @table.name
+        scope = { base => _schema_for_dsl }
+        joins = self.is_a?(Diamond::Table) ? [] : @ast.select { |n| n.is_a?(AST::Join) }
+        joins.each do |j|
+          sch = Diamond.engine.schema_cache[j.table_name]
+          scope[j.table_name] = sch if sch
+        end
+        scope
       end
 
       def _append_to_query(nodes)

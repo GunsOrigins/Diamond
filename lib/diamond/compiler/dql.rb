@@ -247,7 +247,8 @@ module Diamond
         when Symbol
           node.to_s
         when AST::Column
-          "#{prefix}#{node.name}"
+          # already qualified (`tags.tag`) wins over the eager prefix.
+          node.table ? "#{node.table}.#{node.name}" : "#{prefix}#{node.name}"
         when AST::Literal
           params << node.value
           '?'

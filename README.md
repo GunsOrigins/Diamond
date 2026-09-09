@@ -66,8 +66,9 @@ pass values through `find` args, keep literals in the block.
 
 - one block per line. the parser buckets blocks by line, two on one line
   collide. normal formatting and you never hit it.
-- where-blocks only know the base table's columns. no filtering on
-  joined columns.
+- filtering on joined columns needs `table.column` refs, join first:
+  `Posts.join(:tags).where { tags.tag == 'x' }`. barewords still mean
+  the base table.
 - query objects aren't shareable. build them in the worker, ship
   structs back.
 - operators registered after `wake_up` stay in main. workers get
