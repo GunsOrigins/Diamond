@@ -34,7 +34,11 @@ module Diamond
       begin
         stmt.bind(*params)
 
-        projection_node = @ast.find { |n| n.is_a?(AST::Projection) }
+        # union results carry no top-level projection; members come from
+        # the left side (sqlite names union output columns after it).
+        union_node = @ast.find { |n| n.is_a?(AST::Union) }
+        scope_ast = union_node ? union_node.left.ast : @ast
+        projection_node = scope_ast.find { |n| n.is_a?(AST::Projection) }
         projected_columns = projection_node&.columns
 
         @cached_result = []
@@ -74,7 +78,9 @@ module Diamond
       stmt = Diamond.engine.db.prepare(compiled_sql)
       stmt.bind(*compiled_params)
 
-      projection_node   = @ast.find { |n| n.is_a?(AST::Projection) }
+      union_node = @ast.find { |n| n.is_a?(AST::Union) }
+      scope_ast = union_node ? union_node.left.ast : @ast
+      projection_node   = scope_ast.find { |n| n.is_a?(AST::Projection) }
       projected_columns = projection_node&.columns
 
       cursor = Diamond::Cursor.new(@table, stmt, projected_columns)

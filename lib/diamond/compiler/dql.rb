@@ -9,6 +9,16 @@ module Diamond
       }.freeze
 
       def self.compile(table, ast, params = [])
+        # a top-level union renders on its own path: the two sides
+        # compile recursively, params concatenate in order. terminal —
+        # any companion clauses mean someone chained after a union.
+        if (union_node = ast.find { |n| n.is_a?(AST::Union) })
+          if ast.size != 1
+            raise ArgumentError, "union() terminates the chain — chaining after a union isn't supported"
+          end
+          return compile_union(union_node, params)
+        end
+
         # one loop over ast instead of ~8 selects. bucket everything, render after.
         with_clauses = []
         projection   = nil
@@ -20,6 +30,7 @@ module Diamond
         offset_node  = nil
         group_by_node = nil
         having_node  = nil
+        distinct     = false
         ast.each do |n|
           case n
           when AST::With       then with_clauses << n
@@ -32,6 +43,7 @@ module Diamond
           when AST::Offset     then offset_node = n
           when AST::GroupBy    then group_by_node = n
           when AST::Having     then having_node = n
+          when AST::Distinct   then distinct = true
           end
         end
 
@@ -44,7 +56,7 @@ module Diamond
         if has_eager
           return compile_eager(table, from_target, projection, joins, wheres, order_specs,
                                with_clauses, limit_node, offset_node,
-                               group_by_node, having_node, params)
+                               group_by_node, having_node, distinct, params)
         end
 
         with_sql    = render_with(with_clauses, params)
@@ -52,11 +64,11 @@ module Diamond
         from_sql    = "FROM #{from_target}"
         joins_sql   = joins.map { |j| render_join(j, from_target) }.join(' ')
         where_sql   = wheres.empty? ? '' : ' WHERE ' + wheres.map { |w| translate_node(w.condition, params) }.join(' AND ')
-        group_sql   = group_by_node ? " GROUP BY #{group_by_node.columns.join(', ')}" : ''
+        group_sql   = group_by_node ? " GROUP BY #{group_by_node.columns.map { |c| column_sql(c) }.join(', ')}" : ''
         having_sql  = having_node ? ' HAVING ' + translate_node(having_node.condition, params) : ''
 
         # specs already merged up top. one ORDER BY out.
-        order_sql   = order_specs.empty? ? '' : ' ORDER BY ' + order_specs.map { |col, dir| "#{col} #{dir.to_s.upcase}" }.join(', ')
+        order_sql   = order_specs.empty? ? '' : ' ORDER BY ' + order_specs.map { |col, dir| "#{column_sql(col)} #{dir.to_s.upcase}" }.join(', ')
 
         # last Limit/Offset node wins. values go in raw, not bound -
         # _build_limit/_build_offset already checked Integer >= 0, and
@@ -65,15 +77,29 @@ module Diamond
 
         offset_sql  = offset_node ? " OFFSET #{offset_node.value}" : ''
 
-        sql = "#{with_sql} SELECT #{select_sql} #{from_sql}#{joins_sql.empty? ? '' : ' ' + joins_sql}#{where_sql}#{group_sql}#{having_sql}#{order_sql}#{limit_sql}#{offset_sql}"
+        distinct_sql = distinct ? 'DISTINCT ' : ''
+        sql = "#{with_sql} SELECT #{distinct_sql}#{select_sql} #{from_sql}#{joins_sql.empty? ? '' : ' ' + joins_sql}#{where_sql}#{group_sql}#{having_sql}#{order_sql}#{limit_sql}#{offset_sql}"
         sql = sql.strip
         [sql, params, nil]
+      end
+
+      # `(left) UNION ALL (right)`. sides compile through the normal
+      # path so nesting works; each side's params append in order.
+      def self.compile_union(node, params)
+        [node.left, node.right].each do |side|
+          if side.ast.any? { |n| n.is_a?(AST::Join) && n.eager }
+            raise ArgumentError, "union() over eager loads isn't supported"
+          end
+        end
+        lsql, _ = Diamond::Compiler::Base.compile(node.left.table, node.left.ast, params)
+        rsql, _ = Diamond::Compiler::Base.compile(node.right.table, node.right.ast, params)
+        ["#{lsql} UNION ALL #{rsql}", params, nil]
       end
 
       # eager-loading path: build a SELECT with aliased columns (table.col AS
       # "table.col") so the Extralite::Transform can disambiguate which table
       # a column belongs to, then return the transform spec alongside SQL.
-      def self.compile_eager(table, from_target, projection, joins, wheres, order_specs, with_clauses, limit_node, offset_node, group_by_node, having_node, params)
+      def self.compile_eager(table, from_target, projection, joins, wheres, order_specs, with_clauses, limit_node, offset_node, group_by_node, having_node, distinct, params)
         # 1. column list: parent cols (with optional projection) + aliased
         #    columns from each eager join
         parent_cols = if projection
@@ -122,14 +148,15 @@ module Diamond
                       prefix = "#{from_target}."
                       ' WHERE ' + wheres.map { |w| translate_where_qualified(w.condition, params, prefix) }.join(' AND ')
                     end
-        group_sql = group_by_node ? " GROUP BY #{group_by_node.columns.map { |c| "#{from_target}.#{c}" }.join(', ')}" : ''
+        group_sql = group_by_node ? " GROUP BY #{group_by_node.columns.map { |c| column_sql(c, "#{from_target}.") }.join(', ')}" : ''
         having_sql = having_node ? ' HAVING ' + translate_where_qualified(having_node.condition, params, "#{from_target}.") : ''
-        order_sql  = order_specs.empty? ? '' : ' ORDER BY ' + order_specs.map { |col, dir| "#{from_target}.#{col} #{dir.to_s.upcase}" }.join(', ')
+        order_sql  = order_specs.empty? ? '' : ' ORDER BY ' + order_specs.map { |col, dir| "#{column_sql(col, "#{from_target}.")} #{dir.to_s.upcase}" }.join(', ')
         limit_sql  = limit_node ? " LIMIT #{limit_node.value}" : ''
         offset_sql = offset_node ? " OFFSET #{offset_node.value}" : ''
 
         with_sql = render_with(with_clauses, params)
-        sql = "#{with_sql} SELECT #{select_sql} FROM #{from_target}#{joins_sql.empty? ? '' : ' ' + joins_sql}#{where_sql}#{group_sql}#{having_sql}#{order_sql}#{limit_sql}#{offset_sql}".strip
+        distinct_sql = distinct ? 'DISTINCT ' : ''
+        sql = "#{with_sql} SELECT #{distinct_sql}#{select_sql} FROM #{from_target}#{joins_sql.empty? ? '' : ' ' + joins_sql}#{where_sql}#{group_sql}#{having_sql}#{order_sql}#{limit_sql}#{offset_sql}".strip
 
         # 4. build the transform spec
         transform = build_transform(from_target, table, parent_cols, joins)
@@ -229,6 +256,13 @@ module Diamond
       def self.render_projection(node, params)
         return '*' if node.nil?
         node.columns.map { |c| translate_node(c, params) }.join(', ')
+      end
+
+      # order/group entries are bare Symbols or qualified Columns.
+      # qualified columns render with their own table; bare ones take
+      # the caller's prefix (parent table in eager mode, none otherwise).
+      def self.column_sql(col, prefix = '')
+        col.is_a?(AST::Column) && col.table ? "#{col.table}.#{col.name}" : "#{prefix}#{col}"
       end
 
       def self.render_join(node, current_table)

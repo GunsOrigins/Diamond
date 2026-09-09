@@ -234,6 +234,33 @@ describe Diamond do
       _(params).must_equal ["Arle", "Sig"]
       _(q.materialize.map(&:name).sort).must_equal ["Arle", "Sig"]
     end
+
+    it "raises on multi-statement blocks instead of taking the first" do
+      err = assert_raises(ArgumentError) { Users.where { age > 1; age < 100 } }
+      _(err.message).must_match(/one expression/)
+    end
+  end
+
+  # ====================================================================
+  describe "::distinct" do
+    it "emits SELECT DISTINCT" do
+      q = Users.derive { age }.distinct
+      sql, _ = Diamond::Compiler::Base.compile(q.table, q.ast)
+      _(sql).must_equal "SELECT DISTINCT age FROM users"
+    end
+
+    it "dedupes rows" do
+      Users.create(id: 5, name: 'Dup', age: 16)
+      ages = Users.derive { age }.distinct.materialize.map(&:age).sort
+      _(ages.uniq).must_equal ages
+      _(ages.size).must_equal 4
+    end
+
+    it "is idempotent" do
+      q = Users.derive { age }.distinct.distinct
+      sql, _ = Diamond::Compiler::Base.compile(q.table, q.ast)
+      _(sql).must_equal "SELECT DISTINCT age FROM users"
+    end
   end
 
   # ====================================================================
@@ -353,6 +380,14 @@ describe Diamond do
 
     it "raises RecordNotFound for missing ids" do
       _(proc { Users.find(99999).name }).must_raise Diamond::RecordNotFound
+    end
+
+    it "find! returns the struct" do
+      _(Users.find!(1).name).must_equal "Arle"
+    end
+
+    it "find! raises RecordNotFound immediately on missing ids" do
+      _(proc { Users.find!(99999) }).must_raise Diamond::RecordNotFound
     end
   end
 
@@ -525,6 +560,52 @@ describe Diamond do
       q = Posts.join(:tags)
       _(proc { q.where { tags.nope == 1 } }).must_raise Diamond::UnknownColumnError
     end
+
+    it "orders by [table, column] pairs" do
+      q = Posts.join(:tags).order([:tags, :tag])
+      sql, _ = Diamond::Compiler::Base.compile(q.table, q.ast)
+      _(sql).must_include "ORDER BY tags.tag ASC"
+      _(q.materialize.map(&:title)).must_equal ['second', 'first']
+    end
+
+    it "orders by [table, column, dir] triples" do
+      q = Posts.join(:tags).order([:tags, :tag, :desc])
+      sql, _ = Diamond::Compiler::Base.compile(q.table, q.ast)
+      _(sql).must_include "ORDER BY tags.tag DESC"
+      _(q.materialize.map(&:title)).must_equal ['first', 'second']
+    end
+
+    it "keeps bare [col, dir] pairs meaning column + direction" do
+      q = Posts.join(:tags).order([:title, :desc])
+      sql, _ = Diamond::Compiler::Base.compile(q.table, q.ast)
+      _(sql).must_include "ORDER BY title DESC"
+    end
+
+    it "groups by [table, column] pairs" do
+      q = Posts.join(:tags).derive { count(id) }.group([:tags, :tag])
+      sql, _ = Diamond::Compiler::Base.compile(q.table, q.ast)
+      _(sql).must_include "GROUP BY tags.tag"
+    end
+
+    it "derives [table, column] pairs" do
+      q = Posts.join(:tags).derive(:title, [:tags, :tag]).order([:tags, :tag])
+      _(q.materialize.map { |r| [r.title, r.tag] }).must_equal [['second', 'farewell'], ['first', 'greet']]
+    end
+
+    it "raises join-first for pairs without the join" do
+      err = assert_raises(ArgumentError) { Posts.order([:tags, :tag]) }
+      _(err.message).must_match(/\.join\(:tags\)/)
+    end
+
+    it "raises on unknown tables in pairs" do
+      q = Posts.join(:tags)
+      _(proc { q.order([:nope, :tag]) }).must_raise ArgumentError
+    end
+
+    it "raises on bad directions in triples" do
+      q = Posts.join(:tags)
+      _(proc { q.order([:tags, :tag, :sideways]) }).must_raise ArgumentError
+    end
   end
 
   # ====================================================================
@@ -570,10 +651,14 @@ describe Diamond do
       _(Users.find(2).first.name).must_equal "Carby"
     end
 
-    it "supports the assignment block form" do
-      count = Users.where { id == 3 }.update { age = 26; age }
+    it "supports the smalltalk block form" do
+      count = Users.where { id == 3 }.update { age 26 }
       _(count).must_equal 1
       _(Users.find(3).first.age).must_equal 26
+    end
+
+    it "rejects the assignment block form" do
+      _(proc { Users.where { id == 3 }.update { age = 26 } }).must_raise RuntimeError
     end
 
     it "affects all rows when no WHERE clause" do
@@ -1493,6 +1578,53 @@ describe Diamond do
       tree = q.ast_tree
       _(tree).must_include "Join(users, inner)"
       _(tree).must_include "Column(users.name)"
+    end
+  end
+
+  # ====================================================================
+  describe "::union" do
+    it "compiles UNION ALL with params in order" do
+      a = Users.where { age < 20 }
+      b = Users.where { age > 90 }
+      q = a.union(b)
+      sql, params = Diamond::Compiler::Base.compile(q.table, q.ast)
+      _(sql).must_equal "SELECT * FROM users WHERE age < ? UNION ALL SELECT * FROM users WHERE age > ?"
+      _(params).must_equal [20, 90]
+    end
+
+    it "materializes both sides" do
+      a = Users.where { age < 20 }
+      b = Users.where { age > 90 }
+      _(a.union(b).materialize.map(&:name).sort).must_equal ["Arle", "Carbuncle", "High"]
+    end
+
+    it "streams through each" do
+      a = Users.where { age < 20 }
+      b = Users.where { age > 90 }
+      _(a.union(b).each.map(&:name).sort).must_equal ["Arle", "Carbuncle", "High"]
+    end
+
+    it "unions projections by left shape" do
+      a = Users.derive(:name).where { age < 20 }
+      b = Users.derive(:name).where { age > 90 }
+      _(a.union(b).materialize.map(&:name).sort).must_equal ["Arle", "Carbuncle", "High"]
+    end
+
+    it "raises on mismatched widths" do
+      a = Users.derive(:name, :age).where { age < 20 }
+      b = Users.derive(:name).where { age > 90 }
+      err = assert_raises(ArgumentError) { a.union(b) }
+      _(err.message).must_match(/equal widths/)
+    end
+
+    it "raises on non-queries" do
+      err = assert_raises(ArgumentError) { Users.where { age < 20 }.union("nope") }
+      _(err.message).must_match(/needs a QueryObject/)
+    end
+
+    it "raises on chaining after a union" do
+      q = Users.where { age < 20 }.union(Users.where { age > 90 })
+      _(proc { q.limit(1).materialize }).must_raise ArgumentError
     end
   end
 

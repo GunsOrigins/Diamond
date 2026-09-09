@@ -65,8 +65,9 @@ module Diamond
     end
 
     # ====================================================================
-    # update blocks: { col => value } out. `age 17` and `age = 26; age`
-    # both work.
+    # update blocks: { col => value } out. smalltalk form only: `age 17`.
+    # the old `age = 17` assignment form is gone — blocks are parsed,
+    # not run, so an assignment never assigned anything anyway.
     # ====================================================================
     def self.parse_update(block, schema)
       _parse_with_candidates(block, :update) do |node|
@@ -74,13 +75,6 @@ module Diamond
         hash = {}
         statements.each do |stmt|
           case stmt
-          when Prism::LocalVariableWriteNode
-            validate_column!(stmt.name, schema)
-            hash[stmt.name] = literal_value(stmt.value)
-          when Prism::LocalVariableReadNode
-            # trailing `age` in `age = 26; age` keeps ruby from whining
-            # about unused variables. ignored.
-            next
           when Prism::CallNode
             positional, kwargs = split_args(stmt)
             if stmt.receiver.nil? && positional.size == 1 && kwargs.empty?
@@ -195,6 +189,13 @@ module Diamond
       when Prism::BlockNode
         translate_where(node.body, schema, scope)
       when Prism::StatementsNode
+        # one expression per block. silently taking the first would drop
+        # conditions without a trace — say so instead. ArgumentError, not
+        # BlockMismatch: this is bad content in the right block, and the
+        # candidate fallback must not swallow it.
+        if node.body.size != 1
+          raise ArgumentError, "where blocks hold one expression, got #{node.body.size} statements"
+        end
         translate_where(node.body.first, schema, scope)
       when Prism::ParenthesesNode
         translate_where(node.body, schema, scope)

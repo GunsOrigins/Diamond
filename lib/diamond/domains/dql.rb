@@ -14,7 +14,8 @@ module Diamond
         AST::Offset     => :replace,
         AST::GroupBy    => :replace,
         AST::Having     => :replace,
-        AST::Projection => :once
+        AST::Projection => :once,
+        AST::Distinct   => :replace
       }.freeze
 
       # the one operation every chain call funnels through. wraps a bare
@@ -82,6 +83,8 @@ module Diamond
                         raise Diamond::UnknownColumnError.build(_schema_for_dsl, a)
                       end
                       AST::Column.new(a)
+                    elsif a.is_a?(Array) && a.size == 2
+                      _qualified_pair_column(a[0].to_sym, a[1].to_sym)
                     else
                       a
                     end
@@ -111,6 +114,11 @@ module Diamond
       def _build_order(*args, **kwargs)
         pairs = []
         args.each do |a|
+          qualified = _qualified_sort_pair(a)
+          if qualified
+            pairs << qualified
+            next
+          end
           sym, dir =
             if a.is_a?(Array) && a.size == 2 && a[1].is_a?(Symbol)
               [a[0].to_sym, a[1]]
@@ -149,9 +157,16 @@ module Diamond
 
       def _build_group(columns)
         validated = columns.map do |c|
-          sym = c.to_sym
-          raise Diamond::UnknownColumnError.build(_schema_for_dsl, sym) unless _schema_for_dsl[:columns].include?(sym)
-          sym
+          if c.is_a?(Array)
+            unless c.size == 2
+              raise ArgumentError, "group takes columns or [table, column] pairs, got #{c.inspect}"
+            end
+            _qualified_pair_column(c[0].to_sym, c[1].to_sym)
+          else
+            sym = c.to_sym
+            raise Diamond::UnknownColumnError.build(_schema_for_dsl, sym) unless _schema_for_dsl[:columns].include?(sym)
+            sym
+          end
         end
         _chain(AST::GroupBy.new(validated))
       end
@@ -183,6 +198,39 @@ module Diamond
       end
 
       private
+
+      # [table, col] or [table, col, dir] in order/group/derive args.
+      # returns [AST::Column(table:), dir] or nil when `a` isn't a
+      # qualified shape (caller falls back to the plain path). bare
+      # [col, :asc/:desc] pairs keep their old meaning.
+      def _qualified_sort_pair(a)
+        return nil unless a.is_a?(Array) && (a.size == 2 || a.size == 3)
+        return nil unless a[1].is_a?(Symbol) && !%i[asc desc].include?(a[1])
+
+        dir = a.size == 3 ? a[2] : :asc
+        unless %i[asc desc].include?(dir)
+          raise ArgumentError, "direction must be :asc or :desc, got #{dir.inspect}"
+        end
+        [_qualified_pair_column(a[0].to_sym, a[1].to_sym), dir]
+      end
+
+      # validate a [table, column] pair against the chain scope and build
+      # a qualified Column. join-first rule mirrors where-blocks.
+      def _qualified_pair_column(t, c)
+        scope = _scope_for_dsl
+        if scope.key?(t)
+          sch = scope[t]
+          raise Diamond::UnknownColumnError.build(sch, c) unless sch[:columns].include?(c)
+
+          AST::Column.new(c, table: t)
+        elsif Diamond.engine.schema_cache.key?(t)
+          raise ArgumentError,
+                "using '#{t}.#{c}' needs `.join(:#{t})` first " \
+                "(joins must come before the clause that uses them)"
+        else
+          raise ArgumentError, "unknown table '#{t}' in [table, column] pair"
+        end
+      end
 
       def _resolve_join_keys(target_table)
         current = _current_table_name

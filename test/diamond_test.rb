@@ -470,7 +470,7 @@ class DiamondTest < Minitest::Test
   def test_update_block_assignment_form
     # Trailing `age` is a LocalVariableReadNode - Diamond treats it as a
     # no-op reference, and it silences Ruby's "assigned but unused" warning.
-    count = Users.where { id == 3 }.update { age = 26; age }
+    count = Users.where { id == 3 }.update { age 26 }
     assert_equal 1, count
     assert_equal 26, Users.find(3).first.age
   end

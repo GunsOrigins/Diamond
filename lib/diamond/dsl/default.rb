@@ -20,6 +20,15 @@ module Diamond
         _build_where_node(condition)
       end
 
+      # like find, but raises RecordNotFound instead of returning an
+      # empty chain. find stays lazy so it keeps chaining.
+      def find!(id)
+        record = find(id).first
+        raise Diamond::RecordNotFound, "No record found with id #{id.inspect}" if record.nil?
+
+        record
+      end
+
       # `where_in(:col, query)` creates a WHERE col IN (SELECT ...) condition.
       # `Users.where_in(:id, Posts.derive(:user_id))` compiles to
       # `SELECT * FROM users WHERE id IN (SELECT user_id FROM posts)`.
@@ -28,6 +37,26 @@ module Diamond
         sub_node = AST::Subquery.new(subquery)
         condition = AST::In.new(col_node, sub_node)
         _build_where_node(condition)
+      end
+
+      # `left UNION ALL right`. both sides must project the same width
+      # (`*` counts as the table's width). terminal: the result supports
+      # materialize/each/to_sql/explain, but chaining more clauses after
+      # a union raises — aggregates need wrapping.
+      def union(other)
+        raise ArgumentError, "union needs a QueryObject, got #{other.class}" unless other.is_a?(Diamond::QueryObject)
+
+        left = _wrap
+        width = ->(q) {
+          proj = q.ast.find { |n| n.is_a?(AST::Projection) }
+          proj ? proj.columns.size : q.table.schema[:columns].size
+        }
+        lw, rw = width.call(left), width.call(other)
+        unless lw == rw
+          raise ArgumentError, "union needs equal widths, got #{lw} vs #{rw}"
+        end
+
+        Diamond::QueryObject.new(left.table, [AST::Union.new(left, other)])
       end
 
       # Build a projection. Accepts column symbols, AST nodes, or a block
@@ -117,6 +146,10 @@ module Diamond
 
       def offset(n)
         _build_offset(n)
+      end
+
+      def distinct
+        _chain(AST::Distinct.new)
       end
 
       def group(*columns)

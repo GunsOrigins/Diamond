@@ -37,8 +37,12 @@ Posts.where_in(:blog_id, followed).includes(:likes).order(id: :desc).limit(10).m
 | `where { name =~ /^A/ }` | `LIKE`, string or regexp |
 | `q.where { a == 1 }` + `q.or { b == 2 }` | OR |
 | `where_in(:id, Posts.derive(:user_id))` | `IN (SELECT ...)` |
+| `a.union(b)` | `UNION ALL`, equal widths only |
+| `derive(:age).distinct` | `SELECT DISTINCT` |
 | `includes(:posts, :comments)` | one query, nested structs back |
 | `group(:blog_id).having { count(id) > 1 }` | GROUP BY / HAVING |
+| `order([:tags, :tag, :desc])` | sort/group/derive on joined tables |
+| `find!(1)` | struct or RecordNotFound, no laziness |
 | `Diamond.transaction { ... }` | rollback on raise |
 | `Diamond.with_recursive(...)` | recursive CTEs |
 | `update { body "edited" }` | keyword update |
@@ -90,7 +94,8 @@ pass values through `find` args, keep literals in the block.
   better.
 - filtering on joined columns needs `table.column` refs, join first:
   `Posts.join(:tags).where { tags.tag == 'x' }`. barewords still mean
-  the base table.
+  the base table. same rule for `order`/`group`/`derive`, spelled
+  `[:tags, :tag]` (triple with direction for order).
 - query objects aren't shareable. build them in the worker, ship
   structs back.
 - operators registered after `wake_up` stay in main. workers get

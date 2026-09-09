@@ -142,6 +142,10 @@ module Diamond
       def initialize(columns); @columns = columns; end
     end
 
+    # marker: SELECT DISTINCT. carries nothing; presence is the flag.
+    class Distinct < Node
+    end
+
     # `on` maps LOCAL col to FOREIGN col, e.g. { user_id: :id }.
     # `eager: true` marks the join for object-graph transform: the SQL gets
     # column aliases (users.id AS users.id, posts.id AS posts.id, ...) and
@@ -337,7 +341,11 @@ module Diamond
               when Join
                 "Join(#{node.table_name}, #{node.type}#{node.eager ? ', eager' : ''})"
               when Order
-                "Order(#{node.specs.map { |c, d| "#{c} #{d}" }.join(', ')})"
+                labels = node.specs.map do |c, d|
+                  name = c.is_a?(Column) && c.table ? "#{c.table}.#{c.name}" : c.to_s
+                  "#{name} #{d}"
+                end
+                "Order(#{labels.join(', ')})"
               when Limit
                 "Limit(#{node.value})"
               when Offset
