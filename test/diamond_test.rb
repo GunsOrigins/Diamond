@@ -1063,7 +1063,7 @@ class DiamondTest < Minitest::Test
       assert_empty bucket, "purpose bucket should be empty after clear_caches!"
     end
     assert_empty Diamond::StructFactory.caches
-    assert_empty Diamond::Domains::DynamicFinders::FINDER_COLS_CACHE
+    assert_empty Diamond::Domains::DynamicFinders.cache
   end
 
   # ====================================================================

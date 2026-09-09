@@ -42,7 +42,9 @@ module Diamond
         # so the result rows can be deduplicated and nested.
         has_eager = joins.any?(&:eager)
         if has_eager
-          return compile_eager(table, from_target, projection, joins, wheres, order_specs, with_clauses, limit_node, offset_node, params)
+          return compile_eager(table, from_target, projection, joins, wheres, order_specs,
+                               with_clauses, limit_node, offset_node,
+                               group_by_node, having_node, params)
         end
 
         with_sql    = render_with(with_clauses, params)
@@ -71,7 +73,7 @@ module Diamond
       # eager-loading path: build a SELECT with aliased columns (table.col AS
       # "table.col") so the Extralite::Transform can disambiguate which table
       # a column belongs to, then return the transform spec alongside SQL.
-      def self.compile_eager(table, from_target, projection, joins, wheres, order_specs, with_clauses, limit_node, offset_node, params)
+      def self.compile_eager(table, from_target, projection, joins, wheres, order_specs, with_clauses, limit_node, offset_node, group_by_node, having_node, params)
         # 1. column list: parent cols (with optional projection) + aliased
         #    columns from each eager join
         parent_cols = if projection
@@ -111,22 +113,23 @@ module Diamond
         }
         joins_sql = joins.map { |j| render_join_eager.call(j) }.join(' ')
 
-        # 3. WHERE, ORDER BY, LIMIT, OFFSET. when the query is eager, qualify
-        #    bare column names in WHERE/ORDER BY with the parent table name
-        #    so they don't collide with child table columns.
+        # 3. WHERE, GROUP BY, HAVING, ORDER BY, LIMIT, OFFSET. when the query
+        #    is eager, qualify bare column names in WHERE/HAVING with the
+        #    parent table name so they don't collide with child table columns.
         where_sql = if wheres.empty?
                       ''
                     else
-                      # eager mode always qualifies bare columns
                       prefix = "#{from_target}."
                       ' WHERE ' + wheres.map { |w| translate_where_qualified(w.condition, params, prefix) }.join(' AND ')
                     end
+        group_sql = group_by_node ? " GROUP BY #{group_by_node.columns.join(', ')}" : ''
+        having_sql = having_node ? ' HAVING ' + translate_where_qualified(having_node.condition, params, "#{from_target}.") : ''
         order_sql  = order_specs.empty? ? '' : ' ORDER BY ' + order_specs.map { |col, dir| "#{col} #{dir.to_s.upcase}" }.join(', ')
         limit_sql  = limit_node ? " LIMIT #{limit_node.value}" : ''
         offset_sql = offset_node ? " OFFSET #{offset_node.value}" : ''
 
         with_sql = render_with(with_clauses, params)
-        sql = "#{with_sql} SELECT #{select_sql} FROM #{from_target}#{joins_sql.empty? ? '' : ' ' + joins_sql}#{where_sql}#{order_sql}#{limit_sql}#{offset_sql}".strip
+        sql = "#{with_sql} SELECT #{select_sql} FROM #{from_target}#{joins_sql.empty? ? '' : ' ' + joins_sql}#{where_sql}#{group_sql}#{having_sql}#{order_sql}#{limit_sql}#{offset_sql}".strip
 
         # 4. build the transform spec
         transform = build_transform(from_target, table, parent_cols, joins)
@@ -193,53 +196,11 @@ module Diamond
         end
       end
 
-      # Like translate_node but qualifies bare Column references with `prefix`.
-      # Used by eager-mode WHERE/ORDER BY so unqualified columns don't
-      # collide with child table columns in the JOIN.
+      # Kept for the eager path; now a thin wrapper around translate_node
+      # with the parent-table prefix so unqualified Column references don't
+      # collide with child-table columns.
       def self.translate_where_qualified(node, params, prefix)
-        case node
-        when AST::Column
-          "#{prefix}#{node.name}"
-        when AST::IsNull
-          "#{translate_where_qualified(node.column, params, prefix)} IS NULL"
-        when AST::IsNotNull
-          "#{translate_where_qualified(node.column, params, prefix)} IS NOT NULL"
-        when AST::Between
-          col_sql = translate_where_qualified(node.column, params, prefix)
-          low_sql = translate_where_qualified(node.low, params, prefix)
-          high_sql = translate_where_qualified(node.high, params, prefix)
-          "#{col_sql} BETWEEN #{low_sql} AND #{high_sql}"
-        when AST::BinaryOp
-          left  = translate_where_qualified(node.left, params, prefix)
-          right = translate_where_qualified(node.right, params, prefix)
-          if [:AND, :OR].include?(node.operator)
-            "(#{left} #{node.operator} #{right})"
-          else
-            "#{left} #{node.operator} #{right}"
-          end
-        when AST::Literal
-          params << node.value
-          '?'
-        when AST::In, AST::NotIn
-          if node.right.empty?
-            return node.is_a?(AST::NotIn) ? '1=1' : '1=0'
-          end
-          element_sqls = node.right.map { |r| translate_where_qualified(r, params, prefix) }
-          kw = node.is_a?(AST::NotIn) ? 'NOT IN' : 'IN'
-          left_sql = translate_where_qualified(node.left, params, prefix)
-          element_sqls = element_sqls.each_slice(500).map { |g| "#{left_sql} #{kw} (#{g.join(', ')})" }
-          element_sqls.size == 1 ? element_sqls.first : "(#{element_sqls.join(kw == 'IN' ? ' OR ' : ' AND ')})"
-        when AST::AndNode
-          left  = translate_where_qualified(node.left, params, prefix)
-          right = translate_where_qualified(node.right, params, prefix)
-          "(#{left} AND #{right})"
-        when AST::OrNode
-          left  = translate_where_qualified(node.left, params, prefix)
-          right = translate_where_qualified(node.right, params, prefix)
-          "(#{left} OR #{right})"
-        else
-          translate_node(node, params)
-        end
+        translate_node(node, params, prefix: prefix)
       end
 
       def self.render_with(with_nodes, params)
@@ -279,14 +240,14 @@ module Diamond
         "#{sql_type} #{node.table_name} ON #{on_clauses.join(' AND ')}"
       end
 
-      def self.translate_node(node, params)
+      def self.translate_node(node, params, prefix: '')
         hook = Operators.call(node, params)
         return hook if hook
         case node
         when Symbol
           node.to_s
         when AST::Column
-          node.name.to_s
+          "#{prefix}#{node.name}"
         when AST::Literal
           params << node.value
           '?'
@@ -294,19 +255,19 @@ module Diamond
           sub_sql, _ = Diamond::Compiler::Base.compile(node.query.table, node.query.ast, params)
           "(#{sub_sql})"
         when AST::IsNull
-          "#{translate_node(node.column, params)} IS NULL"
+          "#{translate_node(node.column, params, prefix: prefix)} IS NULL"
         when AST::IsNotNull
-          "#{translate_node(node.column, params)} IS NOT NULL"
+          "#{translate_node(node.column, params, prefix: prefix)} IS NOT NULL"
         when AST::Between
-          col_sql = translate_node(node.column, params)
-          low_sql = translate_node(node.low, params)
-          high_sql = translate_node(node.high, params)
+          col_sql = translate_node(node.column, params, prefix: prefix)
+          low_sql = translate_node(node.low, params, prefix: prefix)
+          high_sql = translate_node(node.high, params, prefix: prefix)
           "#{col_sql} BETWEEN #{low_sql} AND #{high_sql}"
         when AST::Function
-          args_str = node.args.map { |a| translate_node(a, params) }.join(', ')
+          args_str = node.args.map { |a| translate_node(a, params, prefix: prefix) }.join(', ')
           "#{node.name}(#{args_str})"
         when AST::WindowFunction
-          args_str = node.args.map { |a| translate_node(a, params) }.join(', ')
+          args_str = node.args.map { |a| translate_node(a, params, prefix: prefix) }.join(', ')
           func_str = "#{node.func_name}(#{args_str})"
           parts = []
           parts << "PARTITION BY #{node.partition_by.join(', ')}" unless node.partition_by.empty?
@@ -317,8 +278,8 @@ module Diamond
             "#{func_str} OVER (#{parts.join(' ')})"
           end
         when AST::BinaryOp
-          left  = translate_node(node.left, params)
-          right = translate_node(node.right, params)
+          left  = translate_node(node.left, params, prefix: prefix)
+          right = translate_node(node.right, params, prefix: prefix)
           if [:AND, :OR].include?(node.operator)
             "(#{left} #{node.operator} #{right})"
           else
@@ -327,8 +288,8 @@ module Diamond
         when AST::In, AST::NotIn
           # subquery form: `col IN (SELECT ...)`
           if node.right.is_a?(AST::Subquery)
-            left_sql  = translate_node(node.left, params)
-            right_sql = translate_node(node.right, params)
+            left_sql  = translate_node(node.left, params, prefix: prefix)
+            right_sql = translate_node(node.right, params, prefix: prefix)
             kw = node.is_a?(AST::NotIn) ? 'NOT IN' : 'IN'
             return "#{left_sql} #{kw} #{right_sql}"
           end
@@ -337,9 +298,9 @@ module Diamond
             return node.is_a?(AST::NotIn) ? '1=1' : '1=0'
           end
           # Elements may be expressions, not just Literals. no `?` then.
-          element_sqls = node.right.map { |r| translate_node(r, params) }
+          element_sqls = node.right.map { |r| translate_node(r, params, prefix: prefix) }
           kw = node.is_a?(AST::NotIn) ? 'NOT IN' : 'IN'
-          left_sql = translate_node(node.left, [])
+          left_sql = translate_node(node.left, [], prefix: prefix)
           # sqlite caps bound vars per statement, so slice big lists into
           # 500s. IN groups get OR, NOT IN groups get AND (de morgan).
           groups = element_sqls.each_slice(500).map { |g| "#{left_sql} #{kw} (#{g.join(', ')})" }

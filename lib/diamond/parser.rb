@@ -10,7 +10,7 @@ module Diamond
     # error trying to read main-Ractor Prism::Node values. each Ractor
     # keeps its own hash on Ractor.current's local storage, keyed by
     # purpose (:where, :derive, :ddl, :update, :line).
-    CACHES_KEY = :_diamond_parser_caches
+    CACHES_KEY = Diamond::RACTOR_KEYS[:parser_caches]
 
     def self.caches
       Ractor.current[CACHES_KEY] ||= Hash.new { |h, k| h[k] = {} }
@@ -20,7 +20,8 @@ module Diamond
     # reload_schema!) drops it all so DDL-heavy scripts don't leak prism
     # trees and dev-reload never serves stale ASTs. no whole-file tree
     # cache on purpose - candidate_blocks indexes once per file, buckets
-    # blocks per line, then lets the tree die.
+    # blocks per line, then lets the tree die. per-Ractor: clears only
+    # the current Ractor's caches (other Ractors retain theirs).
     def self.clear_caches!
       Ractor.current[CACHES_KEY] = Hash.new { |h, k| h[k] = {} }
     end

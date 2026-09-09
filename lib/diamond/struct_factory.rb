@@ -5,7 +5,7 @@ module Diamond
     # struct classes pile up per projection shape. cached per-Ractor on
     # Ractor.current's local storage so each worker warms its own cache
     # without tripping isolation errors.
-    CACHES_KEY = :_diamond_struct_caches
+    CACHES_KEY = Diamond::RACTOR_KEYS[:struct_caches]
 
     def self.caches
       Ractor.current[CACHES_KEY] ||= Hash.new { |h, k| h[k] = {} }

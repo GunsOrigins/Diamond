@@ -8,6 +8,44 @@ require 'extralite'
 require 'prism'
 require 'did_you_mean'
 
+module Diamond
+  class TableNotFound < StandardError; end
+  class RecordNotFound < StandardError; end
+  class InertObjectError < StandardError; end
+
+  class UnknownColumnError < StandardError
+    def self.build(schema, name)
+      cols = schema[:columns].map(&:to_s)
+
+      spell_checker = DidYouMean::SpellChecker.new(dictionary: cols)
+      suggestions = spell_checker.correct(name.to_s)
+
+      message = "Table has no column '#{name}'."
+      message += " Did you mean '#{suggestions.first}'?" unless suggestions.empty?
+
+      new(message)
+    end
+  end
+
+  # Central registry of keys used to stash per-Ractor state in
+  # `Ractor.current[...]`. One place so the namespace stays grep-able and
+  # collisions are impossible. Each consumer module has a constant pointing
+  # here: `Diamond::RACTOR_KEYS[:engine]`, etc.
+  RACTOR_KEYS = {
+    engine:           :_diamond_engine,
+    parser_caches:    :_diamond_parser_caches,
+    struct_caches:    :_diamond_struct_caches,
+    where_ops:        :_diamond_where_ops,
+    derive_ops:       :_diamond_derive_ops,
+    compiler_ops:     :_diamond_compiler_ops,
+    finder_cols:      :_diamond_finder_cols
+  }.freeze
+
+  @db_path = nil
+
+  IDENT_RE = /\A[a-zA-Z_][a-zA-Z0-9_]*\z/.freeze
+end
+
 require_relative 'diamond/version'
 require_relative 'diamond/operator'
 require_relative 'diamond/engine'
@@ -32,28 +70,6 @@ require_relative 'diamond/dsl/default'
 require_relative 'diamond/operators/like'
 
 module Diamond
-  class TableNotFound < StandardError; end
-  class RecordNotFound < StandardError; end
-  class InertObjectError < StandardError; end
-
-  class UnknownColumnError < StandardError
-    def self.build(schema, name)
-      cols = schema[:columns].map(&:to_s)
-
-      spell_checker = DidYouMean::SpellChecker.new(dictionary: cols)
-      suggestions = spell_checker.correct(name.to_s)
-
-      message = "Table has no column '#{name}'."
-      message += " Did you mean '#{suggestions.first}'?" unless suggestions.empty?
-
-      new(message)
-    end
-  end
-
-  @db_path = nil
-
-  IDENT_RE = /\A[a-zA-Z_][a-zA-Z0-9_]*\z/.freeze
-
   def self.quote_ident(name)
     "\"#{name.to_s.gsub('"', '""')}\""
   end
@@ -74,7 +90,7 @@ module Diamond
 
     # Main Ractor initializes its connection immediately for backward compat
     # (so existing tests that touch `Diamond.engine` after wake_up still work).
-    Ractor.current[:_diamond_engine] = Engine.new(@db_path).freeze!
+    Ractor.current[Diamond::RACTOR_KEYS[:engine]] = Engine.new(@db_path).freeze!
 
     # including twice is a no-op for ancestors but still busts ruby's global
     # method cache. guard it so per-test wake_up stays cheap.
@@ -111,8 +127,8 @@ module Diamond
   # because the Table object is immutable after .freeze, and the engine's
   # schema cache is frozen (see Engine#freeze!).
   def self.bind_tables!
-    return unless Ractor.current[:_diamond_engine]
-    Ractor.current[:_diamond_engine].schema_cache.each_key do |table_sym|
+    return unless Ractor.current[Diamond::RACTOR_KEYS[:engine]]
+    Ractor.current[Diamond::RACTOR_KEYS[:engine]].schema_cache.each_key do |table_sym|
       const_name = table_sym.to_s.split('_').map(&:capitalize).join
       next if Object.const_defined?(const_name, false)
       proxy = Table.new(table_sym).freeze
@@ -130,7 +146,7 @@ module Diamond
   # same DB file/connection-string, so every Ractor sees the same logical
   # schema — but live query execution goes through each Ractor's own connection.
   def self.engine
-    Ractor.current[:_diamond_engine] ||= Engine.new(@db_path).freeze!
+    Ractor.current[Diamond::RACTOR_KEYS[:engine]] ||= Engine.new(@db_path).freeze!
   end
 
   # Wrap a block in BEGIN/COMMIT. Rolls back on exception.
@@ -156,6 +172,8 @@ module Diamond
   end
 
   # drop everything derived from the old schema. runs on reload_schema!.
+  # per-Ractor: clears only the calling Ractor's parser/struct/finder
+  # caches. operator registries are untouched (use their `clear!`).
   def self.clear_caches!
     Parser.clear_caches!
     StructFactory.clear_caches!

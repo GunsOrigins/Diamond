@@ -146,12 +146,6 @@ module Diamond
       end
     end
 
-    # Wrap this query as an AST::Subquery node for use in IN clauses:
-    #   Users.where { id.in(Posts.select(:user_id).to_subquery) }
-    def to_subquery
-      AST::Subquery.new(self)
-    end
-
     def count
       pk    = resolve_pk!
       nodes = [AST::Function.new(:count, [AST::Column.new(pk)])]

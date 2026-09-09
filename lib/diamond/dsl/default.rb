@@ -20,35 +20,25 @@ module Diamond
         _build_where_node(condition)
       end
 
-      # `where_sub(:col, query_object)` creates a WHERE col IN (SELECT ...) condition.
-      # `Users.where_sub(:id, Posts.select(:user_id))` compiles to
+      # `where_in(:col, query)` creates a WHERE col IN (SELECT ...) condition.
+      # `Users.where_in(:id, Posts.derive(:user_id))` compiles to
       # `SELECT * FROM users WHERE id IN (SELECT user_id FROM posts)`.
-      def where_sub(column, subquery)
+      def where_in(column, subquery)
         col_node = AST::Column.new(column)
         sub_node = AST::Subquery.new(subquery)
         condition = AST::In.new(col_node, sub_node)
         _build_where_node(condition)
       end
 
+      # alias kept for back-compat
+      alias_method :where_sub, :where_in
+
+      # Build a projection. Accepts column symbols, AST nodes, or a block
+      # that yields bare columns, function calls, and window chains. Also
+      # used to shape a subquery for `where_in`:
+      #   Users.where_in(:id, Posts.derive(:user_id))
       def derive(*args, &block)
         _build_projection(*args, &block)
-      end
-
-      # `select(:col1, :col2)` creates a projection for use as a subquery.
-      # `Users.where { id.in(Posts.select(:user_id)) }` compiles to
-      # `SELECT * FROM users WHERE id IN (SELECT user_id FROM posts)`.
-      def select(*columns)
-        nodes = columns.map do |c|
-          if c.is_a?(Symbol)
-            unless _schema_for_dsl[:columns].include?(c)
-              raise Diamond::UnknownColumnError.build(_schema_for_dsl, c)
-            end
-            AST::Column.new(c)
-          else
-            c
-          end
-        end
-        _append_to_query([AST::Projection.new(nodes)])
       end
 
       def join(table_name, on: nil, type: :inner, eager: false)
@@ -74,6 +64,17 @@ module Diamond
         end
 
         Diamond.engine.load_one_table!(name)
+
+        # bind a frozen top-level constant immediately. without this, a
+        # worker Ractor would have to fall through `const_missing`, which
+        # calls `Object.const_set` and is illegal from non-main Ractors.
+        const_name = name.to_s.split('_').map(&:capitalize).join
+        unless Object.const_defined?(const_name, false)
+          proxy = Diamond::Table.new(name).freeze
+          Object.const_set(const_name, proxy)
+          Diamond.note_bound_table(const_name)
+        end
+
         ast
       end
 

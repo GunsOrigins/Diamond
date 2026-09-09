@@ -9,8 +9,11 @@ module Diamond
     # Ractor's local storage. The module holds only the frozen list of
     # built-ins (which is shareable).
     module Operators
-      STORAGE_KEY = :_diamond_compiler_ops
+      STORAGE_KEY = Diamond::RACTOR_KEYS[:compiler_ops]
 
+      # method, not a constant: this file loads before the Like operator
+      # is defined, so it must resolve lazily. called once per Ractor
+      # (handlers memoizes), so the per-call allocation is irrelevant.
       def self.builtins
         [Diamond::Operators::Like].freeze
       end

@@ -1041,7 +1041,7 @@ describe Diamond do
         _(bucket).must_be_empty
       end
       _(Diamond::StructFactory.caches).must_be_empty
-      _(Diamond::Domains::DynamicFinders::FINDER_COLS_CACHE).must_be_empty
+      _(Diamond::Domains::DynamicFinders.cache).must_be_empty
     end
   end
 
@@ -1324,16 +1324,16 @@ describe Diamond do
     end
 
     it "compiles a subquery in IN clause" do
-      sub = Posts.select(:user_id)
-      q = Users.where_sub(:id, sub)
+      sub = Posts.derive(:user_id)
+      q = Users.where_in(:id, sub)
       sql, params = Diamond::Compiler::Base.compile(q.table, q.ast)
       _(sql).must_include "IN (SELECT user_id FROM posts)"
       _(params).must_be_empty
     end
 
     it "materializes a subquery correctly" do
-      sub = Posts.select(:user_id)
-      results = Users.where_sub(:id, sub).materialize.map(&:name)
+      sub = Posts.derive(:user_id)
+      results = Users.where_in(:id, sub).materialize.map(&:name)
       _(results).must_include 'Arle'
       _(results).must_include 'Carbuncle'
       _(results).wont_include 'Sig'
@@ -1478,6 +1478,23 @@ describe Diamond do
       alice = Users.includes(:posts).materialize.find { |u| u.id == 1 }
       _(alice).must_be_kind_of Struct
       _(alice.frozen?).must_equal true
+    end
+
+    it "supports .where_in combined with .includes" do
+      sub = Posts.derive(:user_id)
+      q = Users.where_in(:id, sub).includes(:posts)
+      sql, params, _spec = Diamond::Compiler::Base.compile(q.table, q.ast)
+      _(sql).must_include "IN (SELECT user_id FROM posts)"
+      _(sql).must_include "LEFT OUTER JOIN posts"
+      _(params).must_be_empty
+      results = q.materialize
+      _(results.size).must_equal 2
+    end
+
+    it "supports .group combined with .includes" do
+      q = Users.includes(:posts).group(:age)
+      sql, _, _ = Diamond::Compiler::Base.compile(q.table, q.ast)
+      _(sql).must_include "GROUP BY age"
     end
   end
 end
