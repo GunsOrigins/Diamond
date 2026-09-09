@@ -29,6 +29,9 @@ Posts.where_in(:blog_id, followed).includes(:likes).order(id: :desc).limit(10).m
 | you write | you get |
 |---|---|
 | `where { age > 10 }` | `WHERE age > ?`, bound param |
+| `where { age >= 10 }` | `>=`, `<=` both work |
+| `where { !(age == 10) }` | `NOT (...)`, `not` keyword too |
+| `where { kind == :text }` | symbols bind as strings |
 | `where { name == nil }` | `IS NULL` |
 | `where { age.between?(16, 25) }` | `BETWEEN ? AND ?` |
 | `where { name =~ /^A/ }` | `LIKE`, string or regexp |

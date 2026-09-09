@@ -225,6 +225,9 @@ module Diamond
             # useful for HAVING clauses.
             args = node.arguments.arguments.map { |a| translate_where(a, schema, scope) }
             AST::Function.new(node.name, args)
+          elsif node.name == :! && node.receiver && node.arguments.nil?
+            # `!(cond)` and `not cond` are the same Prism shape.
+            AST::Not.new(translate_where(node.receiver, schema, scope))
           elsif node.receiver && node.arguments.nil?
             # standalone qualified ref: `tags.tag` (as a between?/in
             # receiver, say). anything else here is still a mismatch.
@@ -260,6 +263,8 @@ module Diamond
           case node.name
           when :> then AST::GreaterThan.new(left, right)
           when :< then AST::LessThan.new(left, right)
+          when :>= then AST::GreaterEqual.new(left, right)
+          when :<= then AST::LessEqual.new(left, right)
           when :== then AST::Equality.new(left, right)
           when :"!=" then AST::NotEqual.new(left, right)
           when :&, :"&&" then AST::And.new(left, right)
@@ -286,6 +291,9 @@ module Diamond
         AST::Literal.new(true)
       when Prism::FalseNode
         AST::Literal.new(false)
+      when Prism::SymbolNode
+        # symbols bind as strings: `kind == :text` means `kind = 'text'`.
+        AST::Literal.new(node.value.to_s)
       else
         raise BlockMismatch, "Unsupported Prism AST Node: #{node.class}"
       end

@@ -86,6 +86,21 @@ module Diamond
       def initialize(left, right); super(left, right, :'<'); end
     end
 
+    class GreaterEqual < BinaryOp
+      def initialize(left, right); super(left, right, :'>='); end
+    end
+
+    class LessEqual < BinaryOp
+      def initialize(left, right); super(left, right, :<=); end
+    end
+
+    # `!(cond)` and `not cond` are the same Prism shape. wraps anything;
+    # sqlite truthiness applies to non-boolean operands.
+    class Not < Node
+      attr_reader :condition
+      def initialize(condition); @condition = condition; end
+    end
+
     class Like < BinaryOp
       def initialize(left, right); super(left, right, :LIKE); end
     end

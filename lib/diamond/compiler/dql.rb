@@ -255,6 +255,8 @@ module Diamond
         when AST::Subquery
           sub_sql, _ = Diamond::Compiler::Base.compile(node.query.table, node.query.ast, params)
           "(#{sub_sql})"
+        when AST::Not
+          "NOT (#{translate_node(node.condition, params, prefix: prefix)})"
         when AST::IsNull
           "#{translate_node(node.column, params, prefix: prefix)} IS NULL"
         when AST::IsNotNull

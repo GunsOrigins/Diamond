@@ -189,6 +189,51 @@ describe Diamond do
       _(composed.ast.size).must_equal 2
       _(composed.first.name).must_equal "Carbuncle"
     end
+
+    it "supports >= and <=" do
+      q = Users.where { age >= 25 }
+      sql, params = Diamond::Compiler::Base.compile(q.table, q.ast)
+      _(sql).must_equal "SELECT * FROM users WHERE age >= ?"
+      _(params).must_equal [25]
+      _(q.materialize.map(&:name).sort).must_equal ["Carbuncle", "High", "Sig"]
+
+      q = Users.where { age <= 16 }
+      _(q.materialize.map(&:name)).must_equal ["Arle"]
+    end
+
+    it "supports ! negation" do
+      q = Users.where { !(age == 16) }
+      sql, params = Diamond::Compiler::Base.compile(q.table, q.ast)
+      _(sql).must_equal "SELECT * FROM users WHERE NOT (age = ?)"
+      _(params).must_equal [16]
+      _(q.materialize.map(&:name).sort).must_equal ["Carbuncle", "High", "Sig"]
+    end
+
+    it "supports not keyword negation" do
+      q = Users.where { not (name == 'Bob') }
+      _(q.materialize.size).must_equal 4
+    end
+
+    it "nests negation" do
+      q = Users.where { !(age >= 25) }
+      _(q.materialize.map(&:name)).must_equal ["Arle"]
+    end
+
+    it "binds symbols as strings" do
+      q = Users.where { name == :Arle }
+      sql, params = Diamond::Compiler::Base.compile(q.table, q.ast)
+      _(sql).must_equal "SELECT * FROM users WHERE name = ?"
+      _(params).must_equal ["Arle"]
+      _(q.materialize.map(&:name)).must_equal ["Arle"]
+    end
+
+    it "binds symbol lists in IN" do
+      q = Users.where { name.in(:Arle, :Sig) }
+      sql, params = Diamond::Compiler::Base.compile(q.table, q.ast)
+      _(sql).must_include "IN"
+      _(params).must_equal ["Arle", "Sig"]
+      _(q.materialize.map(&:name).sort).must_equal ["Arle", "Sig"]
+    end
   end
 
   # ====================================================================
