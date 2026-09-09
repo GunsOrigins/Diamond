@@ -1008,7 +1008,7 @@ class DiamondTest < Minitest::Test
 
   def test_line_cache_populated_after_parse
     Users.where { age > 10 }
-    line_cache = Diamond::Parser.instance_variable_get(:@line_cache)
+    line_cache = Diamond::Parser.line_cache
     refute_empty line_cache, "expected per-line candidate memo to be populated"
   end
 
@@ -1059,10 +1059,10 @@ class DiamondTest < Minitest::Test
     Users.by_name("Arle")
     Users.derive { count(id) }.materialize
     Diamond.clear_caches!
-    %i[@where_cache @derive_cache @ddl_cache @update_cache @line_cache].each do |ivar|
-      assert_empty Diamond::Parser.instance_variable_get(ivar), "#{ivar} should be empty"
+    Diamond::Parser.caches.each_value do |bucket|
+      assert_empty bucket, "purpose bucket should be empty after clear_caches!"
     end
-    assert_empty Diamond::StructFactory.instance_variable_get(:@struct_cache)
+    assert_empty Diamond::StructFactory.caches
     assert_empty Diamond::Domains::DynamicFinders::FINDER_COLS_CACHE
   end
 
@@ -1086,7 +1086,7 @@ class DiamondTest < Minitest::Test
 
   def test_parser_cache_hits_across_invocations
     Users.where { age > 10 }
-    cache = Diamond::Parser.instance_variable_get(:@where_cache)
+    cache = Diamond::Parser.cache_for(:where)
     refute_empty cache, "expected at least one cached where-block translation"
   end
 end

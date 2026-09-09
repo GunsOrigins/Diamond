@@ -6,11 +6,15 @@ module Diamond
     AGGREGATIONS = [:count, :sum, :avg, :min, :max].freeze
     DDL_METHODS  = [:attribute, :primary_key, :foreign_key, :index].freeze
 
-    @where_cache = {}
-    @derive_cache = {}
-    @ddl_cache = {}
-    @update_cache = {}
-    @line_cache = {}
+    # caches are per-Ractor so a worker Ractor doesn't trip an isolation
+    # error trying to read main-Ractor Prism::Node values. each Ractor
+    # keeps its own hash on Ractor.current's local storage, keyed by
+    # purpose (:where, :derive, :ddl, :update, :line).
+    CACHES_KEY = :_diamond_parser_caches
+
+    def self.caches
+      Ractor.current[CACHES_KEY] ||= Hash.new { |h, k| h[k] = {} }
+    end
 
     # everything the parser remembers lives here. clear_caches! (runs on
     # reload_schema!) drops it all so DDL-heavy scripts don't leak prism
@@ -18,11 +22,17 @@ module Diamond
     # cache on purpose - candidate_blocks indexes once per file, buckets
     # blocks per line, then lets the tree die.
     def self.clear_caches!
-      @where_cache = {}
-      @derive_cache = {}
-      @ddl_cache = {}
-      @update_cache = {}
-      @line_cache = {}
+      Ractor.current[CACHES_KEY] = Hash.new { |h, k| h[k] = {} }
+    end
+
+    # the per-Ractor cache hash for a given purpose.
+    def self.cache_for(purpose)
+      caches[purpose]
+    end
+
+    # the per-Ractor line cache (file+line -> Prism::BlockNode[]).
+    def self.line_cache
+      caches[:line]
     end
 
     # ====================================================================
@@ -92,33 +102,26 @@ module Diamond
     # and friends, which mean right block, bad content.
     class BlockMismatch < StandardError; end
 
-    def self.cache_for(purpose)
-      case purpose
-      when :where  then @where_cache
-      when :derive then @derive_cache
-      when :ddl    then @ddl_cache
-      when :update then @update_cache
-      end
-    end
-
     # first lookup for a file parses once, walks once, buckets every block
     # by line. later lines are hash hits. tree dies after indexing - only
     # per-line block subtrees stick around.
     def self.candidate_blocks(file, line)
+      lc = line_cache
       key = [file, line]
-      return @line_cache[key] if @line_cache.key?(key)
+      return lc[key] if lc.key?(key)
       index_file_blocks(file)
-      @line_cache[key] ||= []
+      lc[key] ||= []
     end
 
     def self.index_file_blocks(file)
+      lc = line_cache
       marker = [file, :__indexed__]
-      return if @line_cache.key?(marker)
+      return if lc.key?(marker)
       tree = Prism.parse_file(file).value
       bucket = Hash.new { |h, k| h[k] = [] }
       collect_blocks_into(tree, bucket)
-      bucket.each { |ln, nodes| @line_cache[[file, ln]] = nodes }
-      @line_cache[marker] = true
+      bucket.each { |ln, nodes| lc[[file, ln]] = nodes }
+      lc[marker] = true
       # `tree` falls out of scope here by design (see clear_caches! note).
     end
 

@@ -991,7 +991,7 @@ describe Diamond do
 
     it "populates the per-line candidate memo after parsing" do
       Users.where { age > 10 }
-      line_cache = Diamond::Parser.instance_variable_get(:@line_cache)
+      line_cache = Diamond::Parser.line_cache
       _(line_cache).wont_be_empty
     end
 
@@ -1037,10 +1037,10 @@ describe Diamond do
       Users.by_name("Arle")
       Users.derive { count(id) }.materialize
       Diamond.clear_caches!
-      %i[@where_cache @derive_cache @ddl_cache @update_cache @line_cache].each do |ivar|
-        _(Diamond::Parser.instance_variable_get(ivar)).must_be_empty
+      Diamond::Parser.caches.each_value do |bucket|
+        _(bucket).must_be_empty
       end
-      _(Diamond::StructFactory.instance_variable_get(:@struct_cache)).must_be_empty
+      _(Diamond::StructFactory.caches).must_be_empty
       _(Diamond::Domains::DynamicFinders::FINDER_COLS_CACHE).must_be_empty
     end
   end
@@ -1064,7 +1064,7 @@ describe Diamond do
 
     it "caches where-block translations for repeated invocations" do
       Users.where { age > 10 }
-      cache = Diamond::Parser.instance_variable_get(:@where_cache)
+      cache = Diamond::Parser.cache_for(:where)
       _(cache).wont_be_empty
     end
   end

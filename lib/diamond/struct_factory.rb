@@ -2,11 +2,21 @@ require_relative 'compiler/dql'
 
 module Diamond
   module StructFactory
-    @struct_cache = {}
+    # struct classes pile up per projection shape. cached per-Ractor on
+    # Ractor.current's local storage so each worker warms its own cache
+    # without tripping isolation errors.
+    CACHES_KEY = :_diamond_struct_caches
 
-    # struct classes pile up per projection shape. drop them here.
+    def self.caches
+      Ractor.current[CACHES_KEY] ||= Hash.new { |h, k| h[k] = {} }
+    end
+
+    def self.cache
+      caches[:structs]
+    end
+
     def self.clear_caches!
-      @struct_cache = {}
+      Ractor.current[CACHES_KEY] = Hash.new { |h, k| h[k] = {} }
     end
 
     def self.create(table, row_hash, projection_nodes = nil)
@@ -75,7 +85,7 @@ module Diamond
 
       member_names = members.map(&:first)
       cache_key = "#{table_sym}\0#{member_names.join("\0")}"
-      klass = @struct_cache[cache_key] ||= Struct.new(*member_names) do
+      klass = cache[cache_key] ||= Struct.new(*member_names) do
         def save; raise Diamond::InertObjectError, "Data is inert! Use the Table proxy to update."; end
       end
       klass.new(*members.map(&:last)).freeze
@@ -96,13 +106,13 @@ module Diamond
       # NUL can't appear in identifiers, so [a_b, c] and [a, b_c] stop colliding.
       cache_key = projection_nodes ? "#{table.name}\0#{member_names.join("\0")}" : table.name.to_s
 
-      unless @struct_cache[cache_key]
-        @struct_cache[cache_key] = Struct.new(*member_names) do
+      unless cache[cache_key]
+        cache[cache_key] = Struct.new(*member_names) do
           def save; raise Diamond::InertObjectError, "Data is inert! Use the Table proxy to update."; end
         end
       end
 
-      @struct_cache[cache_key]
+      cache[cache_key]
     end
 
     def self.resolve_members(projection_nodes, table)

@@ -59,13 +59,13 @@ module Diamond
       # ----- Regexp -> LIKE translation -----
 
       UNSUPPORTED = {
-        '(' => 'groups',
-        ')' => 'groups',
-        '|' => 'alternation',
-        '+' => '+ quantifier',
-        '?' => '? quantifier',
-        '{' => '{n,m} quantifier',
-        '[' => 'character class'
+        '(' => 'groups'.freeze,
+        ')' => 'groups'.freeze,
+        '|' => 'alternation'.freeze,
+        '+' => '+ quantifier'.freeze,
+        '?' => '? quantifier'.freeze,
+        '{' => '{n,m} quantifier'.freeze,
+        '[' => 'character class'.freeze
       }.freeze
 
       def self.regexp_to_like(regexp_node)
@@ -129,7 +129,7 @@ module Diamond
         end
       end
 
-      LIKE_WILDCARDS = { '%' => '\%', '_' => '\_', '\\' => '\\\\' }.freeze
+      LIKE_WILDCARDS = { '%' => '\%'.freeze, '_' => '\_'.freeze, '\\' => '\\\\'.freeze }.freeze
 
       def self.escape_like(ch)
         LIKE_WILDCARDS.fetch(ch, ch)

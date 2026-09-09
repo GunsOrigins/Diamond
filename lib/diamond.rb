@@ -50,7 +50,7 @@ module Diamond
     end
   end
 
-  @engine = nil
+  @db_path = nil
 
   IDENT_RE = /\A[a-zA-Z_][a-zA-Z0-9_]*\z/.freeze
 
@@ -70,8 +70,11 @@ module Diamond
   @bound_tables = []
 
   def self.wake_up(db_path)
-    @engine = Engine.new(db_path)
-    @engine.freeze!
+    @db_path = db_path.freeze
+
+    # Main Ractor initializes its connection immediately for backward compat
+    # (so existing tests that touch `Diamond.engine` after wake_up still work).
+    Ractor.current[:_diamond_engine] = Engine.new(@db_path).freeze!
 
     # including twice is a no-op for ancestors but still busts ruby's global
     # method cache. guard it so per-test wake_up stays cheap.
@@ -108,8 +111,8 @@ module Diamond
   # because the Table object is immutable after .freeze, and the engine's
   # schema cache is frozen (see Engine#freeze!).
   def self.bind_tables!
-    return unless @engine
-    @engine.schema_cache.each_key do |table_sym|
+    return unless Ractor.current[:_diamond_engine]
+    Ractor.current[:_diamond_engine].schema_cache.each_key do |table_sym|
       const_name = table_sym.to_s.split('_').map(&:capitalize).join
       next if Object.const_defined?(const_name, false)
       proxy = Table.new(table_sym).freeze
@@ -122,8 +125,12 @@ module Diamond
     @bound_tables << const_name unless @bound_tables.include?(const_name)
   end
 
+  # Per-Ractor engine. Each Ractor opens its own Extralite::Database connection
+  # lazily on first access. The shared schema/FK caches are loaded from the
+  # same DB file/connection-string, so every Ractor sees the same logical
+  # schema — but live query execution goes through each Ractor's own connection.
   def self.engine
-    @engine
+    Ractor.current[:_diamond_engine] ||= Engine.new(@db_path).freeze!
   end
 
   # Wrap a block in BEGIN/COMMIT. Rolls back on exception.
@@ -136,13 +143,14 @@ module Diamond
   # Returns the block's return value on commit, re-raises on rollback.
   def self.transaction(&block)
     raise ArgumentError, "transaction requires a block" unless block
-    @engine.db.execute('BEGIN')
+    db = engine.db
+    db.execute('BEGIN')
     begin
       result = block.call
-      @engine.db.execute('COMMIT')
+      db.execute('COMMIT')
       result
     rescue StandardError
-      @engine.db.execute('ROLLBACK')
+      db.execute('ROLLBACK')
       raise
     end
   end
